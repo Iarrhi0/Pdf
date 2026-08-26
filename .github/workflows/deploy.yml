@@ -1,0 +1,83 @@
+name: Deploy ZIP to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Récupérer le repository
+        uses: actions/checkout@v4
+
+      - name: Préparer le dossier du site
+        run: |
+          mkdir -p _site
+
+      - name: Trouver et extraire le ZIP
+        run: |
+          ZIP_FILE=$(find . -maxdepth 1 -type f -name "*.zip" | head -n 1)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERREUR : Aucun fichier ZIP trouvé à la racine."
+            exit 1
+          fi
+
+          echo "ZIP trouvé : $ZIP_FILE"
+          unzip -q "$ZIP_FILE" -d _extracted
+
+      - name: Trouver automatiquement index.html
+        run: |
+          INDEX_FILE=$(find _extracted -type f -iname "index.html" | head -n 1)
+
+          if [ -z "$INDEX_FILE" ]; then
+            echo "ERREUR : index.html introuvable dans le ZIP."
+            exit 1
+          fi
+
+          SITE_DIR=$(dirname "$INDEX_FILE")
+
+          echo "Site détecté dans : $SITE_DIR"
+
+          cp -a "$SITE_DIR"/. _site/
+
+          echo "Contenu à publier :"
+          find _site -maxdepth 2 -type f
+
+      - name: Vérifier index.html
+        run: |
+          if [ ! -f "_site/index.html" ]; then
+            echo "ERREUR : _site/index.html n'existe pas."
+            exit 1
+          fi
+
+          echo "index.html OK"
+
+      - name: Configurer GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Envoyer les fichiers vers GitHub Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Publier le site
+        id: deployment
+        uses: actions/deploy-pages@v4
