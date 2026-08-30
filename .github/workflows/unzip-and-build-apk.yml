@@ -20,11 +20,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
-          cache: gradle
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
@@ -37,17 +36,23 @@ jobs:
         run: |
           set -euo pipefail
 
+          echo "=== Repository content ==="
+          find . -maxdepth 3 -type f | sort | head -200
+
+          # If gradlew already exists, use the project directly.
           GRADLEW="$(find . -type f -name gradlew -not -path './.git/*' | head -n 1 || true)"
 
+          # Otherwise extract the first ZIP found.
           if [ -z "$GRADLEW" ]; then
             ZIP_FILE="$(find . -type f -iname '*.zip' -not -path './.git/*' | head -n 1 || true)"
 
             if [ -z "$ZIP_FILE" ]; then
-              echo "::error::No Android project (gradlew) and no ZIP file found."
+              echo "::error::No Android project and no ZIP file found."
               exit 1
             fi
 
             echo "ZIP found: $ZIP_FILE"
+
             rm -rf extracted_project
             mkdir -p extracted_project
             unzip -q "$ZIP_FILE" -d extracted_project
@@ -56,23 +61,28 @@ jobs:
           fi
 
           if [ -z "$GRADLEW" ]; then
-            echo "::error::gradlew was not found after extraction."
-            find extracted_project -maxdepth 4 -type f 2>/dev/null | sort | head -300 || true
+            echo "::error::gradlew was not found."
+            echo "Files after extraction:"
+            find extracted_project -maxdepth 5 -type f 2>/dev/null | sort | head -300 || true
             exit 1
           fi
 
           PROJECT_DIR="$(dirname "$GRADLEW")"
 
+          chmod +x "$GRADLEW"
+
           echo "Gradle wrapper: $GRADLEW"
           echo "Project directory: $PROJECT_DIR"
 
-          chmod +x "$GRADLEW"
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
-      - name: Show Gradle information
+      - name: Verify Gradle wrapper
         shell: bash
         working-directory: ${{ env.PROJECT_DIR }}
-        run: ./gradlew --version
+        run: |
+          set -euo pipefail
+          ls -la
+          ./gradlew --version
 
       - name: Build Debug APK
         shell: bash
@@ -80,23 +90,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          if ./gradlew tasks --all | grep -qE '(^|[[:space:]])assembleDebug([[:space:]]|$)'; then
+          echo "Trying standard assembleDebug..."
+          if ./gradlew tasks --all | grep -q "assembleDebug"; then
             ./gradlew assembleDebug --stacktrace
           else
-            MODULE_TASK="$(
-              ./gradlew tasks --all |
-              sed -n 's/^[[:space:]]*\(:[^[:space:]]*:assembleDebug\).*/\1/p' |
-              head -n 1
-            )"
-
-            if [ -z "$MODULE_TASK" ]; then
-              echo "::error::No assembleDebug task found."
-              ./gradlew tasks --all
-              exit 1
-            fi
-
-            echo "Using task: $MODULE_TASK"
-            ./gradlew "$MODULE_TASK" --stacktrace
+            echo "::error::assembleDebug task not found."
+            ./gradlew tasks --all
+            exit 1
           fi
 
       - name: Locate generated APK
@@ -116,11 +116,12 @@ jobs:
           )
 
           if [ "$APK_COUNT" -eq 0 ]; then
-            echo "::error::Build finished but no APK was found."
+            echo "::error::Build succeeded but no APK was found."
             find "${PROJECT_DIR}" -type f \( -name '*.apk' -o -name '*.aab' \) -print || true
             exit 1
           fi
 
+          echo "APK count: $APK_COUNT"
           ls -lh apk-output/
 
       - name: Upload APK
