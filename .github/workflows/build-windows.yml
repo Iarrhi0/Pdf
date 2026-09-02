@@ -1,0 +1,53 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Show versions
+        shell: pwsh
+        run: |
+          node --version
+          npm --version
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Build installer and portable EXE
+        run: npm run build:win
+
+      - name: Verify Windows builds
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path dist -Recurse
+          if (-not (Get-ChildItem -Path dist -Filter *.exe -ErrorAction SilentlyContinue)) {
+            throw 'No Windows EXE was generated.'
+          }
+
+      - name: Upload Windows builds
+        uses: actions/upload-artifact@v6
+        with:
+          name: Chapter-Search-PDF-Windows
+          path: |
+            dist/*.exe
+            dist/*.yml
+          if-no-files-found: error
+          retention-days: 14
