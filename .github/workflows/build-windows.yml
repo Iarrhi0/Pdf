@@ -1,15 +1,23 @@
-name: Build Windows PC EXE
+name: Universal Windows PC Build
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    paths:
+      - '*.zip'
+      - '**/package.json'
+      - '**/*.js'
+      - '**/*.html'
+      - '.github/workflows/build-windows-universal.yml'
 
 permissions:
   contents: read
 
 jobs:
-  build:
+  build-windows:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
@@ -21,90 +29,226 @@ jobs:
           node-version: '24'
           package-manager-cache: false
 
-      - name: Extract PC project
+      - name: Detect PC Electron project
         shell: pwsh
         run: |
-          $zip = "chapter-search-pdf-pc-v1.1-node24.zip"
+          $ErrorActionPreference = "Stop"
 
-          if (-not (Test-Path $zip)) {
-            throw "PC project ZIP not found: $zip"
+          Write-Host "=== Repository files ==="
+          Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -File |
+            Where-Object { $_.FullName -notmatch '\\.git\\' } |
+            Select-Object -First 300 FullName
+
+          $workspace = $env:GITHUB_WORKSPACE
+          $extractRoot = Join-Path $workspace "_universal_extract"
+
+          if (Test-Path $extractRoot) {
+            Remove-Item $extractRoot -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $extractRoot | Out-Null
+
+          function Test-ElectronPackage($packagePath) {
+            try {
+              $pkg = Get-Content $packagePath -Raw | ConvertFrom-Json
+
+              $deps = @()
+              if ($pkg.dependencies) {
+                $deps += $pkg.dependencies.PSObject.Properties.Name
+              }
+              if ($pkg.devDependencies) {
+                $deps += $pkg.devDependencies.PSObject.Properties.Name
+              }
+
+              $scripts = @()
+              if ($pkg.scripts) {
+                $scripts += $pkg.scripts.PSObject.Properties.Name
+              }
+
+              $isElectron = ($deps -contains "electron") -or
+                            ($deps -contains "electron-builder") -or
+                            ($deps -contains "electron-packager") -or
+                            ($scripts -contains "build:win") -or
+                            ($scripts -contains "dist:win")
+
+              return $isElectron
+            }
+            catch {
+              return $false
+            }
           }
 
-          $dest = Join-Path $env:GITHUB_WORKSPACE "pc-project"
+          # 1. Prefer an already extracted Electron project in the repository.
+          $rootPackages = Get-ChildItem -Path $workspace -Filter package.json -Recurse -File |
+            Where-Object {
+              $_.FullName -notmatch '\\node_modules\\' -and
+              $_.FullName -notmatch '\\_universal_extract\\'
+            }
 
-          if (Test-Path $dest) {
-            Remove-Item $dest -Recurse -Force
+          foreach ($package in $rootPackages) {
+            if (Test-ElectronPackage $package.FullName) {
+              $projectDir = $package.Directory.FullName
+              Write-Host "Electron project found directly: $projectDir"
+              "PROJECT_DIR=$projectDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+              "PROJECT_SOURCE=repository" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+              exit 0
+            }
           }
 
-          New-Item -ItemType Directory -Path $dest | Out-Null
-          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          # 2. Otherwise inspect ZIP archives, newest first.
+          $zips = Get-ChildItem -Path $workspace -Filter *.zip -Recurse -File |
+            Where-Object { $_.FullName -notmatch '\\.git\\' } |
+            Sort-Object LastWriteTime -Descending
 
-          $package = Get-ChildItem `
-            -Path $dest `
-            -Filter package.json `
-            -Recurse `
-            -File |
-            Select-Object -First 1
-
-          if (-not $package) {
-            throw "package.json was not found inside $zip"
+          if (-not $zips) {
+            throw "No Electron project or ZIP archive was found."
           }
 
-          $projectDir = $package.Directory.FullName
+          $index = 0
+          foreach ($zip in $zips) {
+            $index++
+            $dest = Join-Path $extractRoot ("zip_" + $index)
+            New-Item -ItemType Directory -Path $dest | Out-Null
 
-          Write-Host "PC project directory: $projectDir"
+            Write-Host "Inspecting ZIP: $($zip.FullName)"
 
-          "PROJECT_DIR=$projectDir" |
-            Out-File `
-              -FilePath $env:GITHUB_ENV `
-              -Encoding utf8 `
-              -Append
+            try {
+              Expand-Archive -Path $zip.FullName -DestinationPath $dest -Force
+            }
+            catch {
+              Write-Warning "Unable to extract $($zip.Name). Skipping."
+              continue
+            }
 
-      - name: Show versions
+            $packages = Get-ChildItem -Path $dest -Filter package.json -Recurse -File |
+              Where-Object { $_.FullName -notmatch '\\node_modules\\' }
+
+            foreach ($package in $packages) {
+              if (Test-ElectronPackage $package.FullName) {
+                $projectDir = $package.Directory.FullName
+
+                Write-Host "Electron project detected in: $($zip.Name)"
+                Write-Host "Project directory: $projectDir"
+
+                "PROJECT_DIR=$projectDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+                "PROJECT_SOURCE=$($zip.Name)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+                exit 0
+              }
+            }
+          }
+
+          throw "No compatible Electron Windows project was found in the repository ZIP files."
+
+      - name: Show detected project
         shell: pwsh
         run: |
-          node --version
-          npm --version
+          Write-Host "Source: $env:PROJECT_SOURCE"
+          Write-Host "Project: $env:PROJECT_DIR"
+          Get-Content (Join-Path $env:PROJECT_DIR "package.json")
 
       - name: Install dependencies
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           Set-Location $env:PROJECT_DIR
-          npm install --no-audit --no-fund
 
-      - name: Build Windows EXE
-        shell: pwsh
-        run: |
-          Set-Location $env:PROJECT_DIR
-          npm run build:win
-
-      - name: Verify Windows EXE
-        shell: pwsh
-        run: |
-          $dist = Join-Path $env:PROJECT_DIR "dist"
-
-          if (-not (Test-Path $dist)) {
-            throw "dist folder was not generated"
+          if (Test-Path "package-lock.json") {
+            npm ci --no-audit --no-fund
+          }
+          else {
+            npm install --no-audit --no-fund
           }
 
-          Get-ChildItem -Path $dist -Recurse
+      - name: Select Windows build command
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-Location $env:PROJECT_DIR
 
-          $exe = Get-ChildItem `
-            -Path $dist `
-            -Filter *.exe `
-            -Recurse `
-            -ErrorAction SilentlyContinue
+          $pkg = Get-Content "package.json" -Raw | ConvertFrom-Json
+          $scripts = @()
 
-          if (-not $exe) {
-            throw "No Windows .exe was generated"
+          if ($pkg.scripts) {
+            $scripts = $pkg.scripts.PSObject.Properties.Name
           }
 
-      - name: Upload Windows EXE
+          if ($scripts -contains "build:win") {
+            $cmd = "npm run build:win"
+          }
+          elseif ($scripts -contains "dist:win") {
+            $cmd = "npm run dist:win"
+          }
+          elseif ($scripts -contains "build:windows") {
+            $cmd = "npm run build:windows"
+          }
+          elseif ($scripts -contains "dist") {
+            $cmd = "npm run dist -- --win"
+          }
+          elseif ($scripts -contains "build") {
+            $cmd = "npm run build -- --win"
+          }
+          else {
+            throw "No compatible Windows build script found in package.json. Expected build:win, dist:win, build:windows, dist or build."
+          }
+
+          Write-Host "Selected command: $cmd"
+          "BUILD_COMMAND=$cmd" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build Windows application
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-Location $env:PROJECT_DIR
+          Invoke-Expression $env:BUILD_COMMAND
+
+      - name: Collect Windows artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $out = Join-Path $env:GITHUB_WORKSPACE "windows-output"
+          if (Test-Path $out) {
+            Remove-Item $out -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $out | Out-Null
+
+          $exeFiles = Get-ChildItem -Path $env:PROJECT_DIR -Filter *.exe -Recurse -File |
+            Where-Object {
+              $_.FullName -match '\\dist\\|\\release\\|\\out\\' -and
+              $_.FullName -notmatch '\\node_modules\\'
+            }
+
+          if (-not $exeFiles) {
+            Write-Host "=== Build output tree ==="
+            Get-ChildItem -Path $env:PROJECT_DIR -Recurse -File |
+              Where-Object { $_.FullName -notmatch '\\node_modules\\' } |
+              Select-Object -First 500 FullName
+
+            throw "Build finished but no Windows .exe was found."
+          }
+
+          foreach ($file in $exeFiles) {
+            Write-Host "Found EXE: $($file.FullName)"
+            Copy-Item $file.FullName -Destination (Join-Path $out $file.Name) -Force
+          }
+
+          # Copy common update metadata when present.
+          Get-ChildItem -Path $env:PROJECT_DIR -Recurse -File |
+            Where-Object {
+              $_.FullName -notmatch '\\node_modules\\' -and
+              ($_.Extension -in @('.yml', '.yaml', '.blockmap')) -and
+              $_.FullName -match '\\dist\\|\\release\\|\\out\\'
+            } |
+            ForEach-Object {
+              Copy-Item $_.FullName -Destination (Join-Path $out $_.Name) -Force
+            }
+
+          Write-Host "=== Final artifacts ==="
+          Get-ChildItem $out | Format-Table Name, Length
+
+      - name: Upload Windows build
         uses: actions/upload-artifact@v6
         with:
-          name: Chapter-Search-PDF-Windows-PC
-          path: |
-            pc-project/**/dist/*.exe
-            pc-project/**/dist/*.yml
+          name: Windows-PC-Build
+          path: windows-output/*
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
