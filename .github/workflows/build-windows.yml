@@ -22,24 +22,77 @@ jobs:
           node-version: '24'
           package-manager-cache: false
 
-      - name: Show versions
+      - name: Extract PC project
         shell: pwsh
         run: |
-          node --version
-          npm --version
+          $zip = "chapter-search-pdf-pc-v1.1-node24.zip"
+
+          if (-not (Test-Path $zip)) {
+            throw "Project archive not found: $zip"
+          }
+
+          $dest = Join-Path $env:GITHUB_WORKSPACE "build-src"
+
+          if (Test-Path $dest) {
+            Remove-Item $dest -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Path $dest | Out-Null
+
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+
+          $package = Get-ChildItem `
+            -Path $dest `
+            -Filter package.json `
+            -Recurse `
+            -File |
+            Select-Object -First 1
+
+          if (-not $package) {
+            throw "package.json not found after extraction"
+          }
+
+          $projectDir = $package.Directory.FullName
+
+          Write-Host "Project directory: $projectDir"
+
+          "PROJECT_DIR=$projectDir" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
 
       - name: Install dependencies
-        run: npm install --no-audit --no-fund
-
-      - name: Build installer and portable EXE
-        run: npm run build:win
-
-      - name: Verify Windows builds
         shell: pwsh
         run: |
-          Get-ChildItem -Path dist -Recurse
-          if (-not (Get-ChildItem -Path dist -Filter *.exe -ErrorAction SilentlyContinue)) {
-            throw 'No Windows EXE was generated.'
+          Set-Location $env:PROJECT_DIR
+          npm install --no-audit --no-fund
+
+      - name: Build Windows EXE
+        shell: pwsh
+        run: |
+          Set-Location $env:PROJECT_DIR
+          npm run build:win
+
+      - name: Verify EXE
+        shell: pwsh
+        run: |
+          $dist = Join-Path $env:PROJECT_DIR "dist"
+
+          if (-not (Test-Path $dist)) {
+            throw "dist directory was not generated"
+          }
+
+          Get-ChildItem $dist -Recurse
+
+          $exe = Get-ChildItem `
+            -Path $dist `
+            -Filter *.exe `
+            -Recurse `
+            -ErrorAction SilentlyContinue
+
+          if (-not $exe) {
+            throw "No Windows EXE was generated"
           }
 
       - name: Upload Windows builds
@@ -47,7 +100,7 @@ jobs:
         with:
           name: Chapter-Search-PDF-Windows
           path: |
-            dist/*.exe
-            dist/*.yml
+            build-src/**/dist/*.exe
+            build-src/**/dist/*.yml
           if-no-files-found: error
           retention-days: 14
