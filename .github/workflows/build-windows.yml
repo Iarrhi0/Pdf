@@ -1,4 +1,4 @@
-name: Build Chapter Search PDF V3 Native
+name: Build Chapter Search PDF V4 Native
 
 on:
   workflow_dispatch:
@@ -10,7 +10,6 @@ on:
       - '**/*.zip'
       - '**/Assets/**'
       - '.github/workflows/build-windows.yml'
-      - '.github/workflows/build-windows-v3-native.yml'
 
 jobs:
   build-windows:
@@ -26,143 +25,110 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Detect or extract V3 project
+      - name: Detect newest V4 project
         id: project
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $candidates = @()
 
-          Write-Host 'Searching for an extracted V3 project...'
-          $proj = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -File -Filter 'ChapterSearchPdfV3.csproj' |
-            Select-Object -First 1
+          function Get-ProjectVersion([string]$projectPath) {
+            try {
+              [xml]$xml = Get-Content -LiteralPath $projectPath -Raw
+              $text = [string]$xml.Project.PropertyGroup.Version
+              if ([string]::IsNullOrWhiteSpace($text)) { return [version]'0.0.0' }
+              return [version]$text
+            } catch { return [version]'0.0.0' }
+          }
 
-          if (-not $proj) {
-            Write-Host 'No extracted project found. Searching V3 ZIP files...'
-
-            $zips = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -File -Filter '*.zip' |
-              Where-Object {
-                $_.Name -match '(?i)chapter[-_ ]?search[-_ ]?pdf.*v3|v3.*webview2|webview2.*native'
-              } |
-              Sort-Object LastWriteTimeUtc -Descending
-
-            if (-not $zips) {
-              throw 'No Chapter Search PDF V3 project or V3 ZIP was found.'
-            }
-
-            foreach ($zip in $zips) {
-              Write-Host "Inspecting V3 ZIP: $($zip.FullName)"
-              $extractDir = Join-Path $env:RUNNER_TEMP ("chapter-search-v3-" + [guid]::NewGuid().ToString('N'))
-              New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
-
-              try {
-                Expand-Archive -LiteralPath $zip.FullName -DestinationPath $extractDir -Force
-              }
-              catch {
-                Write-Warning "Could not extract $($zip.Name): $($_.Exception.Message)"
-                continue
-              }
-
-              $candidate = Get-ChildItem -Path $extractDir -Recurse -File -Filter 'ChapterSearchPdfV3.csproj' |
-                Select-Object -First 1
-
-              if ($candidate) {
-                $proj = $candidate
-                break
-              }
+          Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -File -Filter '*.csproj' | ForEach-Object {
+            $v = Get-ProjectVersion $_.FullName
+            if ($v.Major -ge 4) {
+              $candidates += [pscustomobject]@{ Project=$_.FullName; Version=$v; Source='repository' }
             }
           }
 
-          if (-not $proj) {
-            throw 'ChapterSearchPdfV3.csproj was not found in the repository or V3 ZIP files.'
+          $zips = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -File -Filter '*.zip' | Where-Object {
+            $_.Name -match '(?i)chapter[-_ ]?search[-_ ]?pdf.*v4|v4.*webview2|v4.*multiengine'
+          }
+          foreach ($zip in $zips) {
+            Write-Host "Inspecting V4 ZIP: $($zip.FullName)"
+            $extractDir = Join-Path $env:RUNNER_TEMP ("chapter-search-v4-" + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
+            try {
+              Expand-Archive -LiteralPath $zip.FullName -DestinationPath $extractDir -Force
+              Get-ChildItem -Path $extractDir -Recurse -File -Filter '*.csproj' | ForEach-Object {
+                $v = Get-ProjectVersion $_.FullName
+                if ($v.Major -ge 4) {
+                  $candidates += [pscustomobject]@{ Project=$_.FullName; Version=$v; Source=$zip.Name }
+                }
+              }
+            } catch { Write-Warning "Could not inspect $($zip.Name): $($_.Exception.Message)" }
           }
 
-          Write-Host "V3 project found: $($proj.FullName)"
-          Write-Host "Project folder: $($proj.Directory.FullName)"
+          if (-not $candidates -or $candidates.Count -eq 0) { throw 'No V4 .NET project found.' }
+          $selected = $candidates | Sort-Object Version -Descending | Select-Object -First 1
+          Write-Host "Selected V4 $($selected.Version) from $($selected.Source)"
+          Write-Host "Project: $($selected.Project)"
+          "path=$($selected.Project)" >> $env:GITHUB_OUTPUT
+          "version=$($selected.Version)" >> $env:GITHUB_OUTPUT
 
-          "path=$($proj.FullName)" >> $env:GITHUB_OUTPUT
-          "dir=$($proj.Directory.FullName)" >> $env:GITHUB_OUTPUT
+      - name: Restore dependencies
+        shell: pwsh
+        run: dotnet restore "${{ steps.project.outputs.path }}" --nologo
 
-      - name: Restore V3 dependencies
+      - name: Verify V4 build
         shell: pwsh
         run: |
-          dotnet restore "${{ steps.project.outputs.path }}" --nologo
-
-      - name: Verify V3 build
-        shell: pwsh
-        run: |
-          dotnet build "${{ steps.project.outputs.path }}" `
-            -c Release `
-            --no-restore `
-            --nologo
+          dotnet build "${{ steps.project.outputs.path }}" -c Release --no-restore --nologo
 
       - name: Publish LIGHT x64
         shell: pwsh
         run: |
           $out = Join-Path $env:GITHUB_WORKSPACE 'publish\light'
           dotnet publish "${{ steps.project.outputs.path }}" `
-            -c Release `
-            -r win-x64 `
-            --self-contained false `
-            -p:DebugType=None `
-            -p:DebugSymbols=false `
-            -o $out `
-            --nologo
+            -c Release -r win-x64 --self-contained false `
+            -p:DebugType=None -p:DebugSymbols=false -o $out --nologo
 
-      - name: Publish STANDALONE x64
+      - name: Publish STANDALONE x64 WebView2-safe
         shell: pwsh
         run: |
           $out = Join-Path $env:GITHUB_WORKSPACE 'publish\standalone'
           dotnet publish "${{ steps.project.outputs.path }}" `
-            -c Release `
-            -r win-x64 `
-            --self-contained true `
-            -p:PublishSingleFile=true `
-            -p:IncludeNativeLibrariesForSelfExtract=true `
-            -p:EnableCompressionInSingleFile=true `
-            -p:DebugType=None `
-            -p:DebugSymbols=false `
-            -o $out `
-            --nologo
+            -c Release -r win-x64 --self-contained true `
+            -p:PublishSingleFile=false -p:PublishTrimmed=false `
+            -p:DebugType=None -p:DebugSymbols=false -o $out --nologo
 
-      - name: Show generated files
+      - name: Verify outputs
         shell: pwsh
         run: |
-          Write-Host '=== LIGHT ==='
-          Get-ChildItem "$env:GITHUB_WORKSPACE\publish\light" -Recurse |
-            Select-Object FullName, Length |
-            Format-Table -AutoSize
-
-          Write-Host '=== STANDALONE ==='
-          Get-ChildItem "$env:GITHUB_WORKSPACE\publish\standalone" -Recurse |
-            Select-Object FullName, Length |
-            Format-Table -AutoSize
+          foreach ($kind in @('light','standalone')) {
+            $dir = Join-Path $env:GITHUB_WORKSPACE ("publish\" + $kind)
+            $exe = Join-Path $dir 'ChapterSearchPdfV4.exe'
+            $assets = Join-Path $dir 'Assets'
+            if (-not (Test-Path $exe)) { throw "${kind}: ChapterSearchPdfV4.exe missing" }
+            if (-not (Test-Path $assets)) { throw "${kind}: Assets missing" }
+            $loader = Get-ChildItem -Path $dir -Recurse -File -Filter 'WebView2Loader.dll' | Select-Object -First 1
+            if (-not $loader) { throw "${kind}: WebView2Loader.dll missing" }
+            Write-Host "$kind OK: $exe"
+          }
 
       - name: Package Windows builds
         shell: pwsh
         run: |
-          $lightZip = Join-Path $env:GITHUB_WORKSPACE 'Chapter-Search-PDF-V3-LIGHT-x64.zip'
-          $standaloneZip = Join-Path $env:GITHUB_WORKSPACE 'Chapter-Search-PDF-V3-STANDALONE-x64.zip'
-
-          Compress-Archive `
-            -Path "$env:GITHUB_WORKSPACE\publish\light\*" `
-            -DestinationPath $lightZip `
-            -Force
-
-          Compress-Archive `
-            -Path "$env:GITHUB_WORKSPACE\publish\standalone\*" `
-            -DestinationPath $standaloneZip `
-            -Force
+          Compress-Archive -Path "$env:GITHUB_WORKSPACE\publish\light\*" -DestinationPath "$env:GITHUB_WORKSPACE\Chapter-Search-PDF-V4-LIGHT-x64.zip" -Force
+          Compress-Archive -Path "$env:GITHUB_WORKSPACE\publish\standalone\*" -DestinationPath "$env:GITHUB_WORKSPACE\Chapter-Search-PDF-V4-STANDALONE-x64.zip" -Force
 
       - name: Upload LIGHT build
         uses: actions/upload-artifact@v4
         with:
-          name: Chapter-Search-PDF-V3-LIGHT-x64
-          path: Chapter-Search-PDF-V3-LIGHT-x64.zip
+          name: Chapter-Search-PDF-V4-LIGHT-x64
+          path: Chapter-Search-PDF-V4-LIGHT-x64.zip
           if-no-files-found: error
 
       - name: Upload STANDALONE build
         uses: actions/upload-artifact@v4
         with:
-          name: Chapter-Search-PDF-V3-STANDALONE-x64
-          path: Chapter-Search-PDF-V3-STANDALONE-x64.zip
+          name: Chapter-Search-PDF-V4-STANDALONE-x64
+          path: Chapter-Search-PDF-V4-STANDALONE-x64.zip
           if-no-files-found: error
