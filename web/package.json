@@ -1,12 +1,12 @@
 {
   "name": "chapter-search-pdf-web",
-  "version": "2.2.0",
+  "version": "3.0.0",
   "private": true,
-  "description": "Chapter Search PDF Web/PWA - Node.js backend, Android/PC, deployable on Render",
+  "description": "Chapter Search PDF Web V3 - Render Free streaming low-memory",
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "node --max-old-space-size=256 server.js",
     "dev": "node --watch server.js",
     "test": "node tests/smoke.mjs"
   },

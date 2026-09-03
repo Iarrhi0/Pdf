@@ -1,17 +1,24 @@
 services:
   - type: web
-    name: chapter-search-pdf-web-auto
+    name: Pdf
     runtime: node
     plan: free
     region: singapore
+    rootDir: web
     buildCommand: npm install --omit=dev
     startCommand: npm start
     healthCheckPath: /api/health
-    autoDeployTrigger: 'off'
+    autoDeployTrigger: commit
     envVars:
       - key: NODE_ENV
         value: production
       - key: CSPDF_CONCURRENCY
         value: "2"
       - key: CSPDF_MAX_CONCURRENCY
-        value: "4"
+        value: "3"
+      - key: CSPDF_MEMORY_SOFT_MB
+        value: "260"
+      - key: CSPDF_MEMORY_HARD_MB
+        value: "360"
+      - key: UV_THREADPOOL_SIZE
+        value: "2"
