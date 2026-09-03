@@ -1,254 +1,168 @@
-name: Universal Windows PC Build
+name: Build Chapter Search PDF V3 Native
 
 on:
   workflow_dispatch:
   push:
     branches: [ main, master ]
     paths:
-      - '*.zip'
-      - '**/package.json'
-      - '**/*.js'
-      - '**/*.html'
-      - '.github/workflows/build-windows-universal.yml'
-
-permissions:
-  contents: read
+      - '**/*.cs'
+      - '**/*.csproj'
+      - '**/*.zip'
+      - '**/Assets/**'
+      - '.github/workflows/build-windows.yml'
+      - '.github/workflows/build-windows-v3-native.yml'
 
 jobs:
   build-windows:
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 35
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
-      - name: Setup Node.js 24
-        uses: actions/setup-node@v7
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
         with:
-          node-version: '24'
-          package-manager-cache: false
+          dotnet-version: '8.0.x'
 
-      - name: Detect PC Electron project
+      - name: Detect or extract V3 project
+        id: project
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          $ErrorActionPreference = 'Stop'
 
-          Write-Host "=== Repository files ==="
-          Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -File |
-            Where-Object { $_.FullName -notmatch '\\.git\\' } |
-            Select-Object -First 300 FullName
+          Write-Host 'Searching for an extracted V3 project...'
+          $proj = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -File -Filter 'ChapterSearchPdfV3.csproj' |
+            Select-Object -First 1
 
-          $workspace = $env:GITHUB_WORKSPACE
-          $extractRoot = Join-Path $workspace "_universal_extract"
+          if (-not $proj) {
+            Write-Host 'No extracted project found. Searching V3 ZIP files...'
 
-          if (Test-Path $extractRoot) {
-            Remove-Item $extractRoot -Recurse -Force
-          }
-          New-Item -ItemType Directory -Path $extractRoot | Out-Null
+            $zips = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -File -Filter '*.zip' |
+              Where-Object {
+                $_.Name -match '(?i)chapter[-_ ]?search[-_ ]?pdf.*v3|v3.*webview2|webview2.*native'
+              } |
+              Sort-Object LastWriteTimeUtc -Descending
 
-          function Test-ElectronPackage($packagePath) {
-            try {
-              $pkg = Get-Content $packagePath -Raw | ConvertFrom-Json
+            if (-not $zips) {
+              throw 'No Chapter Search PDF V3 project or V3 ZIP was found.'
+            }
 
-              $deps = @()
-              if ($pkg.dependencies) {
-                $deps += $pkg.dependencies.PSObject.Properties.Name
+            foreach ($zip in $zips) {
+              Write-Host "Inspecting V3 ZIP: $($zip.FullName)"
+              $extractDir = Join-Path $env:RUNNER_TEMP ("chapter-search-v3-" + [guid]::NewGuid().ToString('N'))
+              New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
+
+              try {
+                Expand-Archive -LiteralPath $zip.FullName -DestinationPath $extractDir -Force
               }
-              if ($pkg.devDependencies) {
-                $deps += $pkg.devDependencies.PSObject.Properties.Name
+              catch {
+                Write-Warning "Could not extract $($zip.Name): $($_.Exception.Message)"
+                continue
               }
 
-              $scripts = @()
-              if ($pkg.scripts) {
-                $scripts += $pkg.scripts.PSObject.Properties.Name
-              }
+              $candidate = Get-ChildItem -Path $extractDir -Recurse -File -Filter 'ChapterSearchPdfV3.csproj' |
+                Select-Object -First 1
 
-              $isElectron = ($deps -contains "electron") -or
-                            ($deps -contains "electron-builder") -or
-                            ($deps -contains "electron-packager") -or
-                            ($scripts -contains "build:win") -or
-                            ($scripts -contains "dist:win")
-
-              return $isElectron
-            }
-            catch {
-              return $false
-            }
-          }
-
-          # 1. Prefer an already extracted Electron project in the repository.
-          $rootPackages = Get-ChildItem -Path $workspace -Filter package.json -Recurse -File |
-            Where-Object {
-              $_.FullName -notmatch '\\node_modules\\' -and
-              $_.FullName -notmatch '\\_universal_extract\\'
-            }
-
-          foreach ($package in $rootPackages) {
-            if (Test-ElectronPackage $package.FullName) {
-              $projectDir = $package.Directory.FullName
-              Write-Host "Electron project found directly: $projectDir"
-              "PROJECT_DIR=$projectDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-              "PROJECT_SOURCE=repository" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-              exit 0
-            }
-          }
-
-          # 2. Otherwise inspect ZIP archives, newest first.
-          $zips = Get-ChildItem -Path $workspace -Filter *.zip -Recurse -File |
-            Where-Object { $_.FullName -notmatch '\\.git\\' } |
-            Sort-Object LastWriteTime -Descending
-
-          if (-not $zips) {
-            throw "No Electron project or ZIP archive was found."
-          }
-
-          $index = 0
-          foreach ($zip in $zips) {
-            $index++
-            $dest = Join-Path $extractRoot ("zip_" + $index)
-            New-Item -ItemType Directory -Path $dest | Out-Null
-
-            Write-Host "Inspecting ZIP: $($zip.FullName)"
-
-            try {
-              Expand-Archive -Path $zip.FullName -DestinationPath $dest -Force
-            }
-            catch {
-              Write-Warning "Unable to extract $($zip.Name). Skipping."
-              continue
-            }
-
-            $packages = Get-ChildItem -Path $dest -Filter package.json -Recurse -File |
-              Where-Object { $_.FullName -notmatch '\\node_modules\\' }
-
-            foreach ($package in $packages) {
-              if (Test-ElectronPackage $package.FullName) {
-                $projectDir = $package.Directory.FullName
-
-                Write-Host "Electron project detected in: $($zip.Name)"
-                Write-Host "Project directory: $projectDir"
-
-                "PROJECT_DIR=$projectDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-                "PROJECT_SOURCE=$($zip.Name)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-                exit 0
+              if ($candidate) {
+                $proj = $candidate
+                break
               }
             }
           }
 
-          throw "No compatible Electron Windows project was found in the repository ZIP files."
+          if (-not $proj) {
+            throw 'ChapterSearchPdfV3.csproj was not found in the repository or V3 ZIP files.'
+          }
 
-      - name: Show detected project
+          Write-Host "V3 project found: $($proj.FullName)"
+          Write-Host "Project folder: $($proj.Directory.FullName)"
+
+          "path=$($proj.FullName)" >> $env:GITHUB_OUTPUT
+          "dir=$($proj.Directory.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Restore V3 dependencies
         shell: pwsh
         run: |
-          Write-Host "Source: $env:PROJECT_SOURCE"
-          Write-Host "Project: $env:PROJECT_DIR"
-          Get-Content (Join-Path $env:PROJECT_DIR "package.json")
+          dotnet restore "${{ steps.project.outputs.path }}" --nologo
 
-      - name: Install dependencies
+      - name: Verify V3 build
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          Set-Location $env:PROJECT_DIR
+          dotnet build "${{ steps.project.outputs.path }}" `
+            -c Release `
+            --no-restore `
+            --nologo
 
-          if (Test-Path "package-lock.json") {
-            npm ci --no-audit --no-fund
-          }
-          else {
-            npm install --no-audit --no-fund
-          }
-
-      - name: Select Windows build command
+      - name: Publish LIGHT x64
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          Set-Location $env:PROJECT_DIR
+          $out = Join-Path $env:GITHUB_WORKSPACE 'publish\light'
+          dotnet publish "${{ steps.project.outputs.path }}" `
+            -c Release `
+            -r win-x64 `
+            --self-contained false `
+            -p:DebugType=None `
+            -p:DebugSymbols=false `
+            -o $out `
+            --nologo
 
-          $pkg = Get-Content "package.json" -Raw | ConvertFrom-Json
-          $scripts = @()
-
-          if ($pkg.scripts) {
-            $scripts = $pkg.scripts.PSObject.Properties.Name
-          }
-
-          if ($scripts -contains "build:win") {
-            $cmd = "npm run build:win"
-          }
-          elseif ($scripts -contains "dist:win") {
-            $cmd = "npm run dist:win"
-          }
-          elseif ($scripts -contains "build:windows") {
-            $cmd = "npm run build:windows"
-          }
-          elseif ($scripts -contains "dist") {
-            $cmd = "npm run dist -- --win"
-          }
-          elseif ($scripts -contains "build") {
-            $cmd = "npm run build -- --win"
-          }
-          else {
-            throw "No compatible Windows build script found in package.json. Expected build:win, dist:win, build:windows, dist or build."
-          }
-
-          Write-Host "Selected command: $cmd"
-          "BUILD_COMMAND=$cmd" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Build Windows application
+      - name: Publish STANDALONE x64
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          Set-Location $env:PROJECT_DIR
-          Invoke-Expression $env:BUILD_COMMAND
+          $out = Join-Path $env:GITHUB_WORKSPACE 'publish\standalone'
+          dotnet publish "${{ steps.project.outputs.path }}" `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:EnableCompressionInSingleFile=true `
+            -p:DebugType=None `
+            -p:DebugSymbols=false `
+            -o $out `
+            --nologo
 
-      - name: Collect Windows artifacts
+      - name: Show generated files
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          Write-Host '=== LIGHT ==='
+          Get-ChildItem "$env:GITHUB_WORKSPACE\publish\light" -Recurse |
+            Select-Object FullName, Length |
+            Format-Table -AutoSize
 
-          $out = Join-Path $env:GITHUB_WORKSPACE "windows-output"
-          if (Test-Path $out) {
-            Remove-Item $out -Recurse -Force
-          }
-          New-Item -ItemType Directory -Path $out | Out-Null
+          Write-Host '=== STANDALONE ==='
+          Get-ChildItem "$env:GITHUB_WORKSPACE\publish\standalone" -Recurse |
+            Select-Object FullName, Length |
+            Format-Table -AutoSize
 
-          $exeFiles = Get-ChildItem -Path $env:PROJECT_DIR -Filter *.exe -Recurse -File |
-            Where-Object {
-              $_.FullName -match '\\dist\\|\\release\\|\\out\\' -and
-              $_.FullName -notmatch '\\node_modules\\'
-            }
+      - name: Package Windows builds
+        shell: pwsh
+        run: |
+          $lightZip = Join-Path $env:GITHUB_WORKSPACE 'Chapter-Search-PDF-V3-LIGHT-x64.zip'
+          $standaloneZip = Join-Path $env:GITHUB_WORKSPACE 'Chapter-Search-PDF-V3-STANDALONE-x64.zip'
 
-          if (-not $exeFiles) {
-            Write-Host "=== Build output tree ==="
-            Get-ChildItem -Path $env:PROJECT_DIR -Recurse -File |
-              Where-Object { $_.FullName -notmatch '\\node_modules\\' } |
-              Select-Object -First 500 FullName
+          Compress-Archive `
+            -Path "$env:GITHUB_WORKSPACE\publish\light\*" `
+            -DestinationPath $lightZip `
+            -Force
 
-            throw "Build finished but no Windows .exe was found."
-          }
+          Compress-Archive `
+            -Path "$env:GITHUB_WORKSPACE\publish\standalone\*" `
+            -DestinationPath $standaloneZip `
+            -Force
 
-          foreach ($file in $exeFiles) {
-            Write-Host "Found EXE: $($file.FullName)"
-            Copy-Item $file.FullName -Destination (Join-Path $out $file.Name) -Force
-          }
-
-          # Copy common update metadata when present.
-          Get-ChildItem -Path $env:PROJECT_DIR -Recurse -File |
-            Where-Object {
-              $_.FullName -notmatch '\\node_modules\\' -and
-              ($_.Extension -in @('.yml', '.yaml', '.blockmap')) -and
-              $_.FullName -match '\\dist\\|\\release\\|\\out\\'
-            } |
-            ForEach-Object {
-              Copy-Item $_.FullName -Destination (Join-Path $out $_.Name) -Force
-            }
-
-          Write-Host "=== Final artifacts ==="
-          Get-ChildItem $out | Format-Table Name, Length
-
-      - name: Upload Windows build
-        uses: actions/upload-artifact@v6
+      - name: Upload LIGHT build
+        uses: actions/upload-artifact@v4
         with:
-          name: Windows-PC-Build
-          path: windows-output/*
+          name: Chapter-Search-PDF-V3-LIGHT-x64
+          path: Chapter-Search-PDF-V3-LIGHT-x64.zip
           if-no-files-found: error
-          retention-days: 30
+
+      - name: Upload STANDALONE build
+        uses: actions/upload-artifact@v4
+        with:
+          name: Chapter-Search-PDF-V3-STANDALONE-x64
+          path: Chapter-Search-PDF-V3-STANDALONE-x64.zip
+          if-no-files-found: error
