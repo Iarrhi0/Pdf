@@ -1,0 +1,86 @@
+name: Build Chapter Search PDF Web Lite
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    paths:
+      - '**chapter-search-pdf-web*.zip'
+      - '**/server.py'
+      - '**/web/**'
+      - '.github/workflows/build-web.yml'
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Locate Web Lite project (folder or ZIP)
+        id: locate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $candidates=@()
+          Get-ChildItem -Recurse -Filter server.py -File | ForEach-Object {
+            $d=$_.Directory.FullName
+            if ((Test-Path (Join-Path $d 'requirements.txt')) -and (Test-Path (Join-Path $d 'web\index.html'))) {
+              $candidates += [pscustomobject]@{Path=$d; Version='0.0.0'; Kind='folder'}
+            }
+          }
+          $tmp = Join-Path $env:RUNNER_TEMP 'cspdf-web-scan'; New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          Get-ChildItem -Recurse -Filter *.zip -File | ForEach-Object {
+            if ($_.Name -notmatch 'chapter-search-pdf.*web') { return }
+            $dest=Join-Path $tmp ([IO.Path]::GetFileNameWithoutExtension($_.Name)+'-'+[guid]::NewGuid().ToString('N'))
+            Expand-Archive $_.FullName $dest -Force
+            $srv=Get-ChildItem $dest -Recurse -Filter server.py -File | Where-Object { Test-Path (Join-Path $_.Directory.FullName 'web\index.html') } | Select-Object -First 1
+            if ($srv) {
+              $ver='0.0.0'; $txt=Get-Content $srv.FullName -Raw
+              if ($txt -match 'VERSION\s*=\s*["'']([^"'']+)["'']') {$ver=$Matches[1]}
+              $candidates += [pscustomobject]@{Path=$srv.Directory.FullName; Version=$ver; Kind='zip'}
+            }
+          }
+          if (-not $candidates) { throw 'No Chapter Search PDF Web Lite project found.' }
+          $chosen=$candidates | Sort-Object { try {[version]$_.Version} catch {[version]'0.0.0'} } -Descending | Select-Object -First 1
+          "project=$($chosen.Path)" >> $env:GITHUB_OUTPUT
+          "version=$($chosen.Version)" >> $env:GITHUB_OUTPUT
+          Write-Host "Selected Web Lite $($chosen.Version): $($chosen.Path)"
+      - name: Install dependencies
+        working-directory: ${{ steps.locate.outputs.project }}
+        run: python -m pip install -r requirements.txt
+      - name: Verify engine tests
+        working-directory: ${{ steps.locate.outputs.project }}
+        run: python tests/test_extract.py
+      - name: Build portable Windows backend
+        working-directory: ${{ steps.locate.outputs.project }}
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --onedir --name ChapterSearchPdfWebLite --add-data "web;web" --add-data "config;config" server.py
+          if (!(Test-Path 'dist\ChapterSearchPdfWebLite\ChapterSearchPdfWebLite.exe')) { throw 'EXE not generated' }
+      - name: Add launcher/readme to portable folder
+        working-directory: ${{ steps.locate.outputs.project }}
+        shell: pwsh
+        run: |
+          @'
+          @echo off
+          start "" "%~dp0ChapterSearchPdfWebLite.exe"
+          '@ | Set-Content 'dist\ChapterSearchPdfWebLite\Lancer Chapter Search PDF Web.cmd' -Encoding ascii
+          Copy-Item README.md 'dist\ChapterSearchPdfWebLite\README.md' -Force
+      - name: Upload PORTABLE Windows
+        uses: actions/upload-artifact@v4
+        with:
+          name: Chapter-Search-PDF-Web-Lite-PORTABLE-Windows-v${{ steps.locate.outputs.version }}
+          path: ${{ steps.locate.outputs.project }}/dist/ChapterSearchPdfWebLite/**
+          if-no-files-found: error
+          compression-level: 9
+      - name: Upload Web Lite source
+        uses: actions/upload-artifact@v4
+        with:
+          name: Chapter-Search-PDF-Web-Lite-SOURCE-v${{ steps.locate.outputs.version }}
+          path: |
+            ${{ steps.locate.outputs.project }}/server.py
+            ${{ steps.locate.outputs.project }}/requirements.txt
+            ${{ steps.locate.outputs.project }}/README.md
+            ${{ steps.locate.outputs.project }}/web/**
+            ${{ steps.locate.outputs.project }}/config/**
+          compression-level: 9
