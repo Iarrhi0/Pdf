@@ -1,20 +1,15 @@
 {
   "name": "chapter-search-pdf-web",
-  "version": "3.2.0",
+  "version": "4.0.0",
   "private": true,
-  "description": "Chapter Search PDF Web V3.2 - true streaming PDF for Render Free batch downloads",
+  "description": "Chapter Search PDF Web V4 - Render proxy + client-side streaming PDF for Android and PC",
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node --max-old-space-size=192 server.js",
+    "start": "node --max-old-space-size=128 server.js",
     "dev": "node --watch server.js",
     "test": "node tests/smoke.mjs"
   },
-  "engines": {
-    "node": ">=20"
-  },
-  "dependencies": {
-    "cheerio": "1.1.2",
-    "sharp": "0.34.3"
-  }
+  "engines": { "node": ">=20 <27" },
+  "dependencies": { "cheerio": "1.1.2" }
 }

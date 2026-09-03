@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: Pdf
+    name: chapter-search-pdf-web-auto
     runtime: node
     plan: free
     region: singapore
@@ -12,13 +12,5 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
-      - key: CSPDF_CONCURRENCY
-        value: "2"
-      - key: CSPDF_MAX_CONCURRENCY
-        value: "2"
-      - key: CSPDF_MEMORY_SOFT_MB
-        value: "260"
-      - key: CSPDF_MEMORY_HARD_MB
-        value: "360"
-      - key: UV_THREADPOOL_SIZE
-        value: "2"
+      - key: CSPDF_PROXY_CONCURRENCY
+        value: "4"

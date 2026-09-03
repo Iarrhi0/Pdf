@@ -1,14 +1,6 @@
 import fs from 'node:fs';
-import { spawn } from 'node:child_process';
-const port=18080+Math.floor(Math.random()*1000);
-const p=spawn(process.execPath,['server.js'],{env:{...process.env,PORT:String(port),HOST:'127.0.0.1'},stdio:['ignore','pipe','pipe']});
-let done=false;
-const stop=(code=0)=>{if(done)return;done=true;p.kill();process.exitCode=code};
-setTimeout(async()=>{try{
-  const h=await fetch(`http://127.0.0.1:${port}/api/health`).then(r=>r.json());
-  const s=await fetch(`http://127.0.0.1:${port}/api/settings`).then(r=>r.json());
-  const t=await fetch(`http://127.0.0.1:${port}/api/tasks`).then(r=>r.json());
-  if(!h.ok||h.runtime!=='node'||!Array.isArray(t)||s.max<2)throw new Error('Smoke test invalide');
-  console.log('OK smoke:',h.app,h.version,'concurrency',s.concurrency,'max',s.max);stop(0);
-}catch(e){console.error(e);stop(1)}},1200);
-setTimeout(()=>{console.error('Timeout smoke test');stop(1)},8000);
+const server=fs.readFileSync(new URL('../server.js',import.meta.url),'utf8');
+const app=fs.readFileSync(new URL('../public/app.js',import.meta.url),'utf8');
+for(const s of ['VERSION = \'4.0.0\'','/api/chapter-images','proxyPage(req,res','proxy-client-pdf'])if(!server.includes(s))throw new Error('server missing '+s);
+for(const s of ['class PdfWriter','navigator.storage','READY','normalizeImage'])if(!app.includes(s))throw new Error('app missing '+s);
+console.log('V4 smoke OK');

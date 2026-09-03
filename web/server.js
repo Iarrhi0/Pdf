@@ -8,173 +8,72 @@ import { fileURLToPath } from 'node:url';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { load } from 'cheerio';
-import sharp from 'sharp';
 
 const __filename = fileURLToPath(import.meta.url);
 const ROOT = path.dirname(__filename);
 const PUBLIC = path.join(ROOT, 'public');
 const CONFIG = path.join(ROOT, 'config');
-const TMP = path.join(ROOT, 'tmp');
 const APP_NAME = 'Chapter Search PDF Web';
-const VERSION = '3.2.0';
+const VERSION = '4.0.0';
 const PORT = Number(process.env.PORT || 10000);
 const HOST = process.env.HOST || '0.0.0.0';
-const MAX_CONCURRENCY = clamp(Number(process.env.CSPDF_MAX_CONCURRENCY || 2), 1, 2);
-const DEFAULT_CONCURRENCY = clamp(Number(process.env.CSPDF_CONCURRENCY || 2), 1, MAX_CONCURRENCY);
-const MEMORY_SOFT_MB = clamp(Number(process.env.CSPDF_MEMORY_SOFT_MB || 260), 160, 420);
-const MEMORY_HARD_MB = clamp(Number(process.env.CSPDF_MEMORY_HARD_MB || 360), MEMORY_SOFT_MB + 40, 470);
+const PROXY_MAX = clamp(Number(process.env.CSPDF_PROXY_CONCURRENCY || 4), 1, 6);
 const PHONE_UA = 'Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Mobile Safari/537.36';
 const BAD_IMAGE_TOKENS = ['logo','avatar','icon','sprite','emoji','advert','banner','tracking','pixel','favicon','header','footer','cover','thumbnail','thumb','gravatar','placeholder','loading','lazyload','blank','spacer','transparent','default-image'];
 const CHAPTER_RE = /(?:chapter|chapitre|ch\.?|tome|volume|vol\.?)[\s_\-:#]*(\d+(?:\.\d+)?)/i;
-const ACTIVE_STATES = new Set(['LOAD','ANALYZE','DOWNLOAD','PDF']);
 const MIME = new Map([
   ['.html','text/html; charset=utf-8'],['.js','text/javascript; charset=utf-8'],['.css','text/css; charset=utf-8'],
   ['.json','application/json; charset=utf-8'],['.webmanifest','application/manifest+json; charset=utf-8'],
   ['.png','image/png'],['.jpg','image/jpeg'],['.jpeg','image/jpeg'],['.svg','image/svg+xml'],['.ico','image/x-icon']
 ]);
 
-await fsp.mkdir(TMP, { recursive: true });
-sharp.cache(false);
-sharp.concurrency(1);
-
-function clamp(n, a, b){ return Math.max(a, Math.min(b, Number.isFinite(n) ? n : a)); }
-function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+function clamp(n,a,b){ return Math.max(a,Math.min(b,Number.isFinite(n)?n:a)); }
 function now(){ return Date.now(); }
-function isHttpUrl(u){ try { const x=new URL(u); return x.protocol==='http:'||x.protocol==='https:'; } catch { return false; } }
-function sameOrigin(a,b){ try { return new URL(a).origin===new URL(b).origin; } catch { return false; } }
-function normText(s=''){ return s.normalize('NFKD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,' ').replace(/\s+/g,' ').trim(); }
-function safeName(s='Serie'){ return (s||'Serie').replace(/[<>:\\/*?"|]/g,'_').replace(/\s+/g,' ').trim().replace(/[. ]+$/,'').slice(0,120)||'Serie'; }
-function chapterNumber(text='', url=''){
-  const hay=`${text} ${decodeURIComponentSafe(url)}`;
-  const m=hay.match(CHAPTER_RE); if(m) return Number(m[1]);
-  try { const p=new URL(url).pathname; const x=p.match(/(?:^|[-_/])(\d+(?:\.\d+)?)(?:[-_/]|$)/); if(x && /chapter|chapitre|tome|volume|vol/i.test(hay)) return Number(x[1]); } catch {}
-  return null;
-}
-function decodeURIComponentSafe(s){ try{return decodeURIComponent(s)}catch{return s} }
-function json(res,obj,status=200){ const data=Buffer.from(JSON.stringify(obj)); res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Content-Length':data.length,'Cache-Control':'no-store','Access-Control-Allow-Origin':'*'}); res.end(data); }
-async function bodyJson(req){ const chunks=[]; for await(const c of req) chunks.push(c); if(!chunks.length)return{}; return JSON.parse(Buffer.concat(chunks).toString('utf8')||'{}'); }
-function fetchHeaders(extra={}){ return { 'User-Agent':PHONE_UA, 'Accept-Language':'fr-FR,fr;q=0.9,en;q=0.7', ...extra }; }
-async function fetchWithTimeout(url, opts={}, timeout=25000){ const ctrl=new AbortController(); const timer=setTimeout(()=>ctrl.abort(),timeout); try { return await fetch(url,{redirect:'follow',...opts,signal:ctrl.signal}); } finally { clearTimeout(timer); } }
-async function fetchHtml(url, timeout=25000){
-  const r=await fetchWithTimeout(url,{headers:fetchHeaders({'Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'})},timeout);
-  if(!r.ok) throw new Error(`HTTP ${r.status}`);
-  const text=await r.text(); const ct=(r.headers.get('content-type')||'').toLowerCase();
-  if(!ct.includes('text/html') && !/<html|<!doctype/i.test(text.slice(0,600))) throw new Error("La ressource n'est pas une page HTML");
-  return { html:text, finalUrl:r.url || url, cookies:extractSetCookie(r) };
-}
-function extractSetCookie(r){ try { if(typeof r.headers.getSetCookie==='function') return r.headers.getSetCookie().map(x=>x.split(';')[0]).join('; '); } catch{} return ''; }
-function canonicalSeriesName($, url){
-  const sels=['h1','.post-title h1','.c-breadcrumb li:nth-last-child(2)','.breadcrumb li:nth-last-child(2)']; let title='';
-  for(const sel of sels){ const t=$(sel).first().text().trim(); if(t){title=t;break;} }
-  if(!title) title=$('title').first().text().trim() || path.basename(new URL(url).pathname);
-  title=title.replace(/\s*[-–—:]?\s*(?:chapter|chapitre|tome|volume|vol\.?)\s*\d+(?:\.\d+)?\b.*$/i,'').replace(/[\s\-–—:]+$/,'').trim();
-  return title||'Série';
-}
-function deriveSlugHint(url, series){ const parts=new URL(url).pathname.replace(/^\/+|\/+$/g,'').toLowerCase().split('/'); for(const key of ['catalogue','porncomic']){ const i=parts.indexOf(key); if(i>=0&&parts[i+1]) return parts[i+1]; } return normText(series).replace(/ /g,'-'); }
-function analyzeSeriesHtml(html, baseUrl){
-  const $=load(html); const series=canonicalSeriesName($,baseUrl); const slug=deriveSlugHint(baseUrl,series); const found=new Map(); const engines=[];
-  const add=(el,engine,bonus=0, rawValue=null)=>{
-    const txt=$(el).text().trim(); const raw=rawValue ?? $(el).attr('href') ?? $(el).attr('value') ?? ''; let href;
-    try{href=new URL(raw,baseUrl).href}catch{return}
-    if(!isHttpUrl(href)||!sameOrigin(href,baseUrl))return; const n=chapterNumber(txt,href); if(n==null)return;
-    const p=new URL(href).pathname.toLowerCase(); let score=bonus;
-    if(slug && p.includes(slug)) score+=5; if(/chapter|chapitre|tome|volume|vol/i.test(`${txt} ${p}`)) score+=3;
-    if(/\/(tag|category|author|artist)\//i.test(p)) score-=5;
-    const item={number:n,title:txt||`Chapitre ${n}`,url:href,engine,score}; const old=found.get(n); if(!old||item.score>old.score)found.set(n,item);
-  };
-  for(const sel of ['.wp-manga-chapter a[href]','.chapter-list a[href]','.chapters a[href]','.listing-chapters_wrap a[href]','.eph-num a[href]','.row-content-chapter a[href]']){
-    const nodes=$(sel); if(nodes.length){ if(!engines.includes('S1'))engines.push('S1'); nodes.each((_,e)=>add(e,'S1',10)); }
-  }
-  let good=0; $('select option[value]').each((_,e)=>{ const raw=$(e).attr('value')||''; if(chapterNumber($(e).text(),raw)!=null){add(e,'S2',8,raw);good++;} }); if(good)engines.push('S2');
-  const before=found.size; $('a[href]').each((_,e)=>{ let href; try{href=new URL($(e).attr('href')||'',baseUrl).href}catch{return} const txt=$(e).text().trim(); if(slug && !new URL(href).pathname.toLowerCase().includes(slug) && !normText(txt).replace(/ /g,'-').includes(slug)) return; add(e,'S3',3); }); if(found.size>before)engines.push('S3');
-  const before4=found.size; $('script').each((_,e)=>{ const txt=$(e).html()||''; const matches=txt.match(/https?:\\?\/\\?\/[^\s"'<>\\]+/g)||[]; for(let raw of matches){ raw=raw.replace(/\\\//g,'/'); if(!sameOrigin(raw,baseUrl))continue; const n=chapterNumber('',raw); if(n==null)continue; const fake={}; const old=found.get(n); const item={number:n,title:`Chapitre ${n}`,url:raw,engine:'S4',score:1+(slug&&new URL(raw).pathname.toLowerCase().includes(slug)?5:0)}; if(!old||item.score>old.score)found.set(n,item); } }); if(found.size>before4)engines.push('S4');
-  const chapters=[...found.values()].filter(x=>x.score>=3).sort((a,b)=>a.number-b.number).map(({score,...x})=>x);
-  return {series,chapters,engine:`MULTI ${[...new Set(engines.length?engines:['S3'])].join('-')}`};
-}
-function candidateSeriesPages(html, baseUrl, series){ const $=load(html); const out=[]; const keys=['tous les chapitres','all chapters','tous les volumes','catalogue','serie','série']; $('a[href]').each((_,e)=>{ const txt=normText($(e).text()); let href; try{href=new URL($(e).attr('href')||'',baseUrl).href}catch{return} if(!sameOrigin(href,baseUrl))return; if(keys.some(k=>txt.includes(normText(k))))out.push(href); }); if(new URL(baseUrl).hostname.includes('sushiscan')){ const slug=normText(series).replace(/ /g,'-'); if(slug)out.push(new URL(`/catalogue/${slug}/`,baseUrl).href); } return [...new Set(out)].slice(0,8); }
-async function analyzeSeries(url){ const first=await fetchHtml(url); let result=analyzeSeriesHtml(first.html,first.finalUrl); if(result.chapters.length<2){ for(const sUrl of candidateSeriesPages(first.html,first.finalUrl,result.series)){ try{ const f=await fetchHtml(sUrl,16000); const r=analyzeSeriesHtml(f.html,f.finalUrl); if(r.chapters.length>result.chapters.length){ result=r; result.engine+='+BREADCRUMB'; } }catch{} } } return {...result,source_url:first.finalUrl}; }
-function pickImageUrl($, img, base){ for(const a of ['data-src','data-lazy-src','data-original','data-cfsrc','data-url','data-image','src']){ const u=($(img).attr(a)||'').trim(); if(u&&!u.startsWith('data:')){ try{return new URL(u.split(/\s+/)[0],base).href}catch{} } } const srcset=($(img).attr('data-srcset')||$(img).attr('srcset')||'').trim(); if(srcset){ const p=srcset.split(',').map(x=>x.trim().split(/\s+/)[0]).filter(Boolean); if(p.length){try{return new URL(p.at(-1),base).href}catch{}} } return ''; }
-function badImageUrl(u){ const l=(u||'').toLowerCase(); return !isHttpUrl(u)||BAD_IMAGE_TOKENS.some(t=>l.includes(t)); }
-function extractImages(html, base){ const $=load(html); const selectors=['.reading-content .page-break img','.reading-content img','.page-break img','#readerarea img','.reader-area img','.readerarea img','.ts_reader img','.chapter-content img','.chapter-images img','.container-chapter-reader img','.chapter-body img','.manga-reader img','.comic-reader img','.viewer img','.webtoon-reader img']; let best=[],bestSel=''; for(const sel of selectors){ const urls=[]; $(sel).each((_,e)=>{const u=pickImageUrl($,e,base);if(u&&!badImageUrl(u))urls.push(u)}); const uniq=[...new Set(urls)]; if(uniq.length>best.length){best=uniq;bestSel=sel;} } if(best.length>=2)return{urls:best,engine:`APK40:${bestSel}`}; const all=[]; $('img').each((_,e)=>{const u=pickImageUrl($,e,base);if(u&&!badImageUrl(u))all.push(u)}); const groups=new Map(); for(const u of [...new Set(all)]){const x=new URL(u); const key=`${x.host}|${path.posix.dirname(x.pathname)}`; if(!groups.has(key))groups.set(key,[]);groups.get(key).push(u);} if(groups.size)best=[...groups.values()].sort((a,b)=>b.length-a.length)[0]; return{urls:best,engine:'JAVA5-LITE'}; }
-async function hashFile(file){ return await new Promise((resolve,reject)=>{ const h=crypto.createHash('sha256'); const r=fs.createReadStream(file); r.on('data',c=>h.update(c)); r.on('error',reject); r.on('end',()=>resolve(h.digest('hex'))); }); }
-async function imageMetaFile(file, bytes, sha256){ try{ const m=await sharp(file,{failOn:'none',sequentialRead:true}).metadata(); const w=m.width||0,h=m.height||0; if(w<250||h<350||w*h<150000)return null; if(bytes<12000&&w*h<500000)return null; return{width:w,height:h,format:(m.format||'').toLowerCase(),space:(m.space||'').toLowerCase(),channels:m.channels||0,sha256}; }catch{return null;} }
-let sharpBusy=false;
-async function ensurePdfJpegFile(input, meta, output){
-  const direct=(meta.format==='jpeg'||meta.format==='jpg') && meta.space!=='cmyk' && meta.channels<=3;
-  if(direct)return input;
-  while(sharpBusy)await sleep(25);
-  sharpBusy=true;
-  try{
-    await sharp(input,{failOn:'none',sequentialRead:true}).rotate().flatten({background:'#ffffff'}).toColourspace('srgb').jpeg({quality:90,mozjpeg:false}).toFile(output);
-    return output;
-  }finally{sharpBusy=false;}
-}
+function isHttpUrl(u){ try{ const x=new URL(u); return x.protocol==='http:'||x.protocol==='https:'; }catch{return false;} }
+function sameOrigin(a,b){ try{return new URL(a).origin===new URL(b).origin}catch{return false;} }
+function normText(s=''){return s.normalize('NFKD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,' ').replace(/\s+/g,' ').trim();}
+function decodeURIComponentSafe(s){try{return decodeURIComponent(s)}catch{return s}}
+function json(res,obj,status=200,extra={}){const data=Buffer.from(JSON.stringify(obj));res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Content-Length':data.length,'Cache-Control':'no-store','Access-Control-Allow-Origin':'*',...extra});res.end(data);}
+async function bodyJson(req){const chunks=[];for await(const c of req)chunks.push(c);if(!chunks.length)return{};return JSON.parse(Buffer.concat(chunks).toString('utf8')||'{}');}
+function fetchHeaders(extra={}){return {'User-Agent':PHONE_UA,'Accept-Language':'fr-FR,fr;q=0.9,en;q=0.7',...extra};}
+async function fetchWithTimeout(url,opts={},timeout=25000){const ctrl=new AbortController();const timer=setTimeout(()=>ctrl.abort(),timeout);try{return await fetch(url,{redirect:'follow',...opts,signal:ctrl.signal});}finally{clearTimeout(timer);}}
+async function fetchHtml(url,timeout=25000){const r=await fetchWithTimeout(url,{headers:fetchHeaders({'Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'})},timeout);if(!r.ok)throw new Error(`HTTP ${r.status}`);const text=await r.text();const ct=(r.headers.get('content-type')||'').toLowerCase();if(!ct.includes('text/html')&&!/<html|<!doctype/i.test(text.slice(0,600)))throw new Error("La ressource n'est pas une page HTML");return{html:text,finalUrl:r.url||url,cookies:extractSetCookie(r)};}
+function extractSetCookie(r){try{if(typeof r.headers.getSetCookie==='function')return r.headers.getSetCookie().map(x=>x.split(';')[0]).join('; ');}catch{}return '';}
+function chapterNumber(text='',url=''){const hay=`${text} ${decodeURIComponentSafe(url)}`;const m=hay.match(CHAPTER_RE);if(m)return Number(m[1]);try{const p=new URL(url).pathname;const x=p.match(/(?:^|[-_/])(\d+(?:\.\d+)?)(?:[-_/]|$)/);if(x&&/chapter|chapitre|tome|volume|vol/i.test(hay))return Number(x[1]);}catch{}return null;}
+function canonicalSeriesName($,url){const sels=['h1','.post-title h1','.c-breadcrumb li:nth-last-child(2)','.breadcrumb li:nth-last-child(2)'];let title='';for(const sel of sels){const t=$(sel).first().text().trim();if(t){title=t;break;}}if(!title)title=$('title').first().text().trim()||path.basename(new URL(url).pathname);title=title.replace(/\s*[-–—:]?\s*(?:chapter|chapitre|tome|volume|vol\.?)\s*\d+(?:\.\d+)?\b.*$/i,'').replace(/[\s\-–—:]+$/,'').trim();return title||'Série';}
+function deriveSlugHint(url,series){const parts=new URL(url).pathname.replace(/^\/+|\/+$/g,'').toLowerCase().split('/');for(const key of ['catalogue','porncomic']){const i=parts.indexOf(key);if(i>=0&&parts[i+1])return parts[i+1];}return normText(series).replace(/ /g,'-');}
+function analyzeSeriesHtml(html,baseUrl){const $=load(html);const series=canonicalSeriesName($,baseUrl),slug=deriveSlugHint(baseUrl,series),found=new Map(),engines=[];const add=(el,engine,bonus=0,rawValue=null)=>{const txt=$(el).text().trim(),raw=rawValue??$(el).attr('href')??$(el).attr('value')??'';let href;try{href=new URL(raw,baseUrl).href}catch{return}if(!isHttpUrl(href)||!sameOrigin(href,baseUrl))return;const n=chapterNumber(txt,href);if(n==null)return;const p=new URL(href).pathname.toLowerCase();let score=bonus;if(slug&&p.includes(slug))score+=5;if(/chapter|chapitre|tome|volume|vol/i.test(`${txt} ${p}`))score+=3;if(/\/(tag|category|author|artist)\//i.test(p))score-=5;const item={number:n,title:txt||`Chapitre ${n}`,url:href,engine,score};const old=found.get(n);if(!old||item.score>old.score)found.set(n,item);};
+for(const sel of ['.wp-manga-chapter a[href]','.chapter-list a[href]','.chapters a[href]','.listing-chapters_wrap a[href]','.eph-num a[href]','.row-content-chapter a[href]']){const nodes=$(sel);if(nodes.length){if(!engines.includes('S1'))engines.push('S1');nodes.each((_,e)=>add(e,'S1',10));}}
+let good=0;$('select option[value]').each((_,e)=>{const raw=$(e).attr('value')||'';if(chapterNumber($(e).text(),raw)!=null){add(e,'S2',8,raw);good++;}});if(good)engines.push('S2');
+const before=found.size;$('a[href]').each((_,e)=>{let href;try{href=new URL($(e).attr('href')||'',baseUrl).href}catch{return}const txt=$(e).text().trim();if(slug&&!new URL(href).pathname.toLowerCase().includes(slug)&&!normText(txt).replace(/ /g,'-').includes(slug))return;add(e,'S3',3);});if(found.size>before)engines.push('S3');
+const before4=found.size;$('script').each((_,e)=>{const txt=$(e).html()||'';const matches=txt.match(/https?:\\?\/\\?\/[^\s"'<>\\]+/g)||[];for(let raw of matches){raw=raw.replace(/\\\//g,'/');if(!sameOrigin(raw,baseUrl))continue;const n=chapterNumber('',raw);if(n==null)continue;const old=found.get(n),item={number:n,title:`Chapitre ${n}`,url:raw,engine:'S4',score:1+(slug&&new URL(raw).pathname.toLowerCase().includes(slug)?5:0)};if(!old||item.score>old.score)found.set(n,item);}});if(found.size>before4)engines.push('S4');
+const chapters=[...found.values()].filter(x=>x.score>=3).sort((a,b)=>a.number-b.number).map(({score,...x})=>x);return{series,chapters,engine:`MULTI ${[...new Set(engines.length?engines:['S3'])].join('-')}`};}
+function candidateSeriesPages(html,baseUrl,series){const $=load(html),out=[],keys=['tous les chapitres','all chapters','tous les volumes','catalogue','serie','série'];$('a[href]').each((_,e)=>{const txt=normText($(e).text());let href;try{href=new URL($(e).attr('href')||'',baseUrl).href}catch{return}if(!sameOrigin(href,baseUrl))return;if(keys.some(k=>txt.includes(normText(k))))out.push(href);});if(new URL(baseUrl).hostname.includes('sushiscan')){const slug=normText(series).replace(/ /g,'-');if(slug)out.push(new URL(`/catalogue/${slug}/`,baseUrl).href);}return[...new Set(out)].slice(0,8);}
+async function analyzeSeries(url){const first=await fetchHtml(url);let result=analyzeSeriesHtml(first.html,first.finalUrl);if(result.chapters.length<2){for(const sUrl of candidateSeriesPages(first.html,first.finalUrl,result.series)){try{const f=await fetchHtml(sUrl,16000),r=analyzeSeriesHtml(f.html,f.finalUrl);if(r.chapters.length>result.chapters.length){result=r;result.engine+='+BREADCRUMB';}}catch{}}}return{...result,source_url:first.finalUrl};}
+function pickImageUrl($,img,base){for(const a of ['data-src','data-lazy-src','data-original','data-cfsrc','data-url','data-image','src']){const u=($(img).attr(a)||'').trim();if(u&&!u.startsWith('data:')){try{return new URL(u.split(/\s+/)[0],base).href}catch{}}}const srcset=($(img).attr('data-srcset')||$(img).attr('srcset')||'').trim();if(srcset){const p=srcset.split(',').map(x=>x.trim().split(/\s+/)[0]).filter(Boolean);if(p.length){try{return new URL(p.at(-1),base).href}catch{}}}return '';}
+function badImageUrl(u){const l=(u||'').toLowerCase();return!isHttpUrl(u)||BAD_IMAGE_TOKENS.some(t=>l.includes(t));}
+function extractImages(html,base){const $=load(html);const selectors=['.reading-content .page-break img','.reading-content img','.page-break img','#readerarea img','.reader-area img','.readerarea img','.ts_reader img','.chapter-content img','.chapter-images img','.container-chapter-reader img','.chapter-body img','.manga-reader img','.comic-reader img','.viewer img','.webtoon-reader img'];let best=[],bestSel='';for(const sel of selectors){const urls=[];$(sel).each((_,e)=>{const u=pickImageUrl($,e,base);if(u&&!badImageUrl(u))urls.push(u)});const uniq=[...new Set(urls)];if(uniq.length>best.length){best=uniq;bestSel=sel;}}if(best.length>=2)return{urls:best,engine:`APK40:${bestSel}`};const all=[];$('img').each((_,e)=>{const u=pickImageUrl($,e,base);if(u&&!badImageUrl(u))all.push(u)});const groups=new Map();for(const u of [...new Set(all)]){const x=new URL(u),key=`${x.host}|${path.posix.dirname(x.pathname)}`;if(!groups.has(key))groups.set(key,[]);groups.get(key).push(u);}if(groups.size)best=[...groups.values()].sort((a,b)=>b.length-a.length)[0];return{urls:best,engine:'JAVA5-LITE'};}
 
-class StreamingPdfWriter{
-  constructor(file){this.file=file;this.fd=null;this.offset=0;this.offsets=new Map();this.pages=[];this.nextObj=3;}
-  async open(){this.fd=await fsp.open(this.file,'w');await this.write(Buffer.from('%PDF-1.4\n%\xE2\xE3\xCF\xD3\n','binary'));return this;}
-  async write(data){const b=Buffer.isBuffer(data)?data:Buffer.from(String(data),'ascii');await this.fd.write(b,0,b.length,this.offset);this.offset+=b.length;}
-  async objStart(n){this.offsets.set(n,this.offset);await this.write(`${n} 0 obj\n`);}
-  async copyFile(file){for await(const chunk of fs.createReadStream(file)){await this.write(chunk);}}
-  async addJpeg(file,width,height,channels=3){
-    const imageObj=this.nextObj++,contentObj=this.nextObj++,pageObj=this.nextObj++;
-    const st=await fsp.stat(file);const pageW=595;const pageH=Math.max(842,pageW*height/Math.max(1,width));
-    const scale=Math.min(pageW/Math.max(1,width),pageH/Math.max(1,height));const drawW=width*scale,drawH=height*scale;
-    const x=(pageW-drawW)/2,y=(pageH-drawH)/2;const color=channels===1?'/DeviceGray':'/DeviceRGB';
-    await this.objStart(imageObj);await this.write(`<< /Type /XObject /Subtype /Image /Width ${width} /Height ${height} /ColorSpace ${color} /BitsPerComponent 8 /Filter /DCTDecode /Length ${st.size} >>\nstream\n`);await this.copyFile(file);await this.write('\nendstream\nendobj\n');
-    const content=`q\n${drawW.toFixed(3)} 0 0 ${drawH.toFixed(3)} ${x.toFixed(3)} ${y.toFixed(3)} cm\n/Im0 Do\nQ\n`;
-    await this.objStart(contentObj);await this.write(`<< /Length ${Buffer.byteLength(content)} >>\nstream\n${content}endstream\nendobj\n`);
-    await this.objStart(pageObj);await this.write(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${pageW} ${pageH.toFixed(3)}] /Resources << /XObject << /Im0 ${imageObj} 0 R >> >> /Contents ${contentObj} 0 R >>\nendobj\n`);this.pages.push(pageObj);
-  }
-  async finish(){
-    await this.objStart(1);await this.write('<< /Type /Catalog /Pages 2 0 R >>\nendobj\n');
-    await this.objStart(2);await this.write(`<< /Type /Pages /Count ${this.pages.length} /Kids [${this.pages.map(n=>`${n} 0 R`).join(' ')}] >>\nendobj\n`);
-    const maxObj=this.nextObj-1;const xref=this.offset;await this.write(`xref\n0 ${maxObj+1}\n0000000000 65535 f \n`);
-    for(let i=1;i<=maxObj;i++){const off=this.offsets.get(i);if(off==null)throw new Error(`Objet PDF manquant ${i}`);await this.write(`${String(off).padStart(10,'0')} 00000 n \n`);}
-    await this.write(`trailer\n<< /Size ${maxObj+1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`);await this.fd.close();this.fd=null;
-  }
-  async abort(){try{if(this.fd)await this.fd.close()}catch{}this.fd=null;}
-}
-async function fetchImageToFile(url, referer, cookie, file){ const headers=fetchHeaders({'Accept':'image/avif,image/webp,image/apng,image/*,*/*;q=0.8','Referer':referer}); if(cookie)headers.Cookie=cookie; let r=await fetchWithTimeout(url,{headers},26000); if(r.status===416){headers.Range='bytes=0-';r=await fetchWithTimeout(url,{headers},26000);} if(!r.ok)throw new Error(`HTTP ${r.status}`); const ct=(r.headers.get('content-type')||'').toLowerCase(); if((ct.startsWith('text/')||ct.includes('html'))&&!ct.startsWith('image/'))throw new Error(`Contenu non-image (${ct||'inconnu'})`); if(!r.body)throw new Error('Réponse image vide'); let bytes=0; const src=Readable.fromWeb(r.body); src.on('data',c=>{bytes+=c.length}); await pipeline(src,fs.createWriteStream(file)); const sha256=await hashFile(file); return{bytes,sha256}; }
-async function removeQuiet(...files){ for(const f of files){if(!f)continue;try{await fsp.rm(f,{force:true})}catch{}} }
-function rssMb(){return process.memoryUsage().rss/1024/1024;}
-function downloadName(series,n){return `${safeName(series)} - Chapitre ${Number(n).toString().replace(/\.0$/,'')}.pdf`;}
-function taskPublic(t){ const {timer,...p}=t; return {...p}; }
-class TaskManager{
-  constructor(){this.tasks=new Map();this.concurrency=DEFAULT_CONCURRENCY;this.running=0;this.totalBytes=0;this.lastBytes=0;this.lastSpeedAt=now();this.speed=0;setInterval(()=>this.tick(),180).unref();setInterval(()=>this.cleanupOldFiles(),300000).unref();}
-  setConcurrency(n){this.concurrency=clamp(Number(n),1,MAX_CONCURRENCY);}
-  effectiveConcurrency(){const mb=rssMb();if(mb>=MEMORY_HARD_MB)return 1;if(mb>=MEMORY_SOFT_MB)return Math.min(this.concurrency,1);if(mb>=MEMORY_SOFT_MB-60)return Math.min(this.concurrency,2);return this.concurrency;}
-  addMany(series,chapters){const ids=[];const exists=new Set([...this.tasks.values()].filter(t=>t.state!=='DELETED').map(t=>`${t.url}|${t.number}`));for(const c of chapters){const key=`${c.url}|${Number(c.number)}`;if(exists.has(key))continue;const id=crypto.randomBytes(5).toString('hex');this.tasks.set(id,{id,series,number:Number(c.number),title:c.title||`Chapitre ${c.number}`,url:c.url,state:'QUEUED',processed:0,total:0,valid:0,ignored:0,progress:0,speed_bps:0,error:'',output:'',engine:'',created:now(),started:0,ended:0,paused:false,cancelled:false,bytes_done:0});ids.push(id);exists.add(key);}return ids;}
-  tick(){const cap=this.effectiveConcurrency();if(this.running>=cap)return;for(const t of this.tasks.values()){if(this.running>=cap)break;if(t.state==='QUEUED'){this.running++;t.state='LOAD';this.run(t).finally(()=>{this.running--;});}}}
-  async waitIfPaused(t){while(t.paused&&!t.cancelled){t.state='PAUSED';await sleep(150);}if(!t.cancelled&&t.state==='PAUSED')t.state='DOWNLOAD';if(t.cancelled)throw new Error('__CANCELLED__');}
-  async run(t){let tmpPdf='',writer=null;const workDir=path.join(TMP,`work-${t.id}`);try{await fsp.mkdir(workDir,{recursive:true});t.started=now();t.state='LOAD';const page=await fetchHtml(t.url);t.url=page.finalUrl;if(t.cancelled)throw new Error('__CANCELLED__');t.state='ANALYZE';const ex=extractImages(page.html,page.finalUrl);const referer=page.finalUrl,cookies=page.cookies;page.html='';t.engine=ex.engine;t.total=ex.urls.length;if(t.total<2)throw new Error(`Seulement ${t.total} image(s) candidate(s)`);tmpPdf=path.join(TMP,`${t.id}.pdf.part`);writer=await new StreamingPdfWriter(tmpPdf).open();const seen=new Set();let validBytes=0,lastTaskBytes=0,lastTaskAt=now();t.state='DOWNLOAD';for(let i=0;i<ex.urls.length;i++){await this.waitIfPaused(t);const rawFile=path.join(workDir,`${String(i+1).padStart(4,'0')}.img`);const converted=path.join(workDir,`${String(i+1).padStart(4,'0')}.jpg`);try{const got=await fetchImageToFile(ex.urls[i],referer,cookies,rawFile);const meta=await imageMetaFile(rawFile,got.bytes,got.sha256);if(!meta||seen.has(meta.sha256)){t.ignored++;}else{seen.add(meta.sha256);const pdfImg=await ensurePdfJpegFile(rawFile,meta,converted);const finalMeta=pdfImg===rawFile?meta:await imageMetaFile(pdfImg,(await fsp.stat(pdfImg)).size,meta.sha256);if(!finalMeta){t.ignored++;}else{await writer.addJpeg(pdfImg,finalMeta.width,finalMeta.height,finalMeta.channels||3);t.valid++;validBytes+=got.bytes;}}t.bytes_done+=got.bytes;this.totalBytes+=got.bytes;}catch(e){if(e.message==='__CANCELLED__')throw e;t.ignored++;}finally{await removeQuiet(rawFile,converted);}t.processed=i+1;t.progress=t.processed/Math.max(1,t.total);const ts=now();if(ts-lastTaskAt>=600){t.speed_bps=(t.bytes_done-lastTaskBytes)/((ts-lastTaskAt)/1000);lastTaskBytes=t.bytes_done;lastTaskAt=ts;}if(rssMb()>=MEMORY_HARD_MB)await sleep(500);}t.state='PDF';await writer.finish();writer=null;const ratio=t.valid/Math.max(1,t.total),avg=validBytes/Math.max(1,t.valid);if(t.valid<2||(t.total>=5&&ratio<0.60)||(t.valid>=10&&avg<18000))throw new Error(`Qualité insuffisante: ${t.valid}/${t.total} vraies pages`);const final=path.join(TMP,`${t.id}-${downloadName(t.series,t.number)}`);await fsp.rename(tmpPdf,final);tmpPdf='';t.output=final;t.state='SAVED';t.ended=now();setTimeout(()=>removeQuiet(final),60*60*1000).unref();
-  }catch(e){if(writer)await writer.abort();if(tmpPdf)await removeQuiet(tmpPdf);if(e.message==='__CANCELLED__'){t.state='STOPPED';t.error='Arrêté';}else{t.state='ERROR';t.error=e.message||String(e);}t.ended=now();}finally{try{await fsp.rm(workDir,{recursive:true,force:true})}catch{}}}
-  action(id,a){const t=this.tasks.get(id);if(!t)return[false,'Tâche introuvable'];if(a==='pause'){t.paused=true;return[true,'En pause'];}if(a==='resume'){t.paused=false;if(t.state==='PAUSED')t.state='DOWNLOAD';return[true,'Reprise'];}if(a==='retry'){if(['ERROR','STOPPED','SAVED'].includes(t.state)){t.cancelled=false;t.paused=false;t.state='QUEUED';t.error='';t.output='';t.processed=t.valid=t.ignored=0;t.progress=0;t.bytes_done=0;}return[true,'Relancée'];}if(a==='cancel'){t.cancelled=true;return[true,'Arrêt demandé'];}if(a==='delete'){t.cancelled=true;this.tasks.delete(id);return[true,'Supprimée'];}return[true,'OK'];}
-  async cleanupOldFiles(){try{const files=await fsp.readdir(TMP,{withFileTypes:true});const cutoff=now()-2*60*60*1000;for(const e of files){if(e.name.startsWith('work-'))continue;const f=path.join(TMP,e.name);try{const st=await fsp.stat(f);if(st.mtimeMs<cutoff)await fsp.rm(f,{recursive:true,force:true});}catch{}}}catch{}}
-  stats(){const n=now(),dt=Math.max(1,n-this.lastSpeedAt);if(dt>=700){this.speed=(this.totalBytes-this.lastBytes)/(dt/1000);this.lastBytes=this.totalBytes;this.lastSpeedAt=n;}const arr=[...this.tasks.values()];return{cpu_app:Math.min(100,Number(((process.cpuUsage().user+process.cpuUsage().system)/1e6/Math.max(1,process.uptime())/Math.max(1,os.cpus().length)*100).toFixed(1))),cpu_pc:null,ram_app:process.memoryUsage().rss,ram_pc:Number(((1-os.freemem()/os.totalmem())*100).toFixed(1)),speed:this.speed,active:arr.filter(t=>ACTIVE_STATES.has(t.state)).length,down:arr.filter(t=>t.state==='DOWNLOAD').length,queued:arr.filter(t=>t.state==='QUEUED').length,errors:arr.filter(t=>t.state==='ERROR').length,concurrency:this.concurrency,effective_concurrency:this.effectiveConcurrency(),max:MAX_CONCURRENCY,memory_soft_mb:MEMORY_SOFT_MB,memory_hard_mb:MEMORY_HARD_MB,hosted:!!process.env.RENDER};}
-}
-const MANAGER=new TaskManager();
+const sessions=new Map();
+function makeSession(referer,cookie,urls){const id=crypto.randomBytes(12).toString('hex');sessions.set(id,{referer,cookie,urls,created:now(),last:now()});return id;}
+setInterval(()=>{const cutoff=now()-30*60*1000;for(const[id,s]of sessions)if(s.last<cutoff)sessions.delete(id);},5*60*1000).unref();
+let proxyActive=0;const proxyWait=[];
+async function acquireProxy(){if(proxyActive<PROXY_MAX){proxyActive++;return;}await new Promise(r=>proxyWait.push(r));proxyActive++;}
+function releaseProxy(){proxyActive--;const r=proxyWait.shift();if(r)r();}
+async function prepareChapter(url){const page=await fetchHtml(url);const ex=extractImages(page.html,page.finalUrl);if(ex.urls.length<2)throw new Error(`Seulement ${ex.urls.length} image(s) candidate(s)`);const session=makeSession(page.finalUrl,page.cookies,ex.urls);return{session,count:ex.urls.length,engine:ex.engine,referer:page.finalUrl};}
+async function proxyPage(req,res,sid,index){const s=sessions.get(sid);if(!s||!Number.isInteger(index)||index<0||index>=s.urls.length)return json(res,{error:'SESSION_EXPIRED'},404,{'X-CSPDF-Session':'expired'});s.last=now();await acquireProxy();try{const headers=fetchHeaders({'Accept':'image/avif,image/webp,image/apng,image/*,*/*;q=0.8','Referer':s.referer});if(s.cookie)headers.Cookie=s.cookie;let r=await fetchWithTimeout(s.urls[index],{headers},28000);if(r.status===416){headers.Range='bytes=0-';r=await fetchWithTimeout(s.urls[index],{headers},28000);}if(!r.ok)return json(res,{error:`HTTP ${r.status}`},502);const ct=(r.headers.get('content-type')||'application/octet-stream').toLowerCase();if((ct.startsWith('text/')||ct.includes('html'))&&!ct.startsWith('image/'))return json(res,{error:`Contenu non-image (${ct})`},502);const out={'Content-Type':ct,'Cache-Control':'no-store','Access-Control-Allow-Origin':'*','X-CSPDF-Index':String(index)};const len=r.headers.get('content-length');if(len)out['Content-Length']=len;res.writeHead(200,out);if(!r.body)return res.end();await pipeline(Readable.fromWeb(r.body),res);}catch(e){if(!res.headersSent)json(res,{error:e?.message||String(e)},502);else try{res.destroy()}catch{}}finally{releaseProxy();}}
 async function loadSources(){try{return JSON.parse(await fsp.readFile(path.join(CONFIG,'sources.json'),'utf8')).sources||[]}catch{return[]}}
-async function searchSources(q){q=q.trim();if(!q)return[];const srcs=(await loadSources()).filter(x=>x.enabled!==false);const results=[];await Promise.all(srcs.slice(0,8).map(async src=>{try{const u=src.search.replace('{q}',encodeURIComponent(q));const f=await fetchHtml(u,12000);const $=load(f.html);const seen=new Set();$('a[href]').each((_,e)=>{if(results.length>=30)return;const txt=$(e).text().trim();let href;try{href=new URL($(e).attr('href')||'',f.finalUrl).href}catch{return}if(txt.length<2||!sameOrigin(href,src.base))return;if(!normText(txt).includes(normText(q)))return;const k=`${txt}|${href}`;if(seen.has(k))return;seen.add(k);results.push({source:src.name,title:txt.slice(0,120),url:href});});}catch{}}));return results.slice(0,30);}
+async function searchSources(q){q=q.trim();if(!q)return[];const srcs=(await loadSources()).filter(x=>x.enabled!==false),results=[];await Promise.all(srcs.slice(0,8).map(async src=>{try{const u=src.search.replace('{q}',encodeURIComponent(q)),f=await fetchHtml(u,12000),$=load(f.html),seen=new Set();$('a[href]').each((_,e)=>{if(results.length>=30)return;const txt=$(e).text().trim();let href;try{href=new URL($(e).attr('href')||'',f.finalUrl).href}catch{return}if(txt.length<2||!sameOrigin(href,src.base)||!normText(txt).includes(normText(q)))return;const k=`${txt}|${href}`;if(seen.has(k))return;seen.add(k);results.push({source:src.name,title:txt.slice(0,120),url:href});});}catch{}}));return results.slice(0,30);}
 function staticPath(urlPath){let p=urlPath==='/'?'/index.html':urlPath;try{p=decodeURIComponent(p)}catch{}const full=path.normalize(path.join(PUBLIC,p));return full.startsWith(PUBLIC)?full:null;}
 async function serveStatic(req,res,u){const full=staticPath(u.pathname);if(!full)return json(res,{error:'Interdit'},403);try{const st=await fsp.stat(full);if(!st.isFile())throw 0;res.writeHead(200,{'Content-Type':MIME.get(path.extname(full).toLowerCase())||'application/octet-stream','Content-Length':st.size,'Cache-Control':u.pathname==='/sw.js'?'no-cache':'public, max-age=300'});fs.createReadStream(full).pipe(res);}catch{json(res,{error:'Introuvable'},404)}}
-async function handler(req,res){const u=new URL(req.url,`http://${req.headers.host||'localhost'}`);if(req.method==='OPTIONS'){res.writeHead(204,{'Access-Control-Allow-Origin':'*','Access-Control-Allow-Methods':'GET,POST,OPTIONS','Access-Control-Allow-Headers':'Content-Type'});return res.end();}
-  try{
-    if(req.method==='GET'&&u.pathname==='/api/health')return json(res,{ok:true,app:APP_NAME,version:VERSION,runtime:'node'});
-    if(req.method==='GET'&&u.pathname==='/api/tasks')return json(res,[...MANAGER.tasks.values()].sort((a,b)=>b.created-a.created).map(taskPublic));
-    if(req.method==='GET'&&u.pathname==='/api/stats')return json(res,MANAGER.stats());
-    if(req.method==='GET'&&u.pathname==='/api/settings')return json(res,{concurrency:MANAGER.concurrency,effective:MANAGER.effectiveConcurrency(),max:MAX_CONCURRENCY,output:'Stockage temporaire serveur • streaming faible RAM',hosted:!!process.env.RENDER});
-    if(req.method==='GET'&&u.pathname==='/api/search')return json(res,await searchSources(u.searchParams.get('q')||''));
-    if(req.method==='GET'&&u.pathname.startsWith('/api/pdf/')){const id=u.pathname.split('/').pop();const t=MANAGER.tasks.get(id);if(!t?.output||!fs.existsSync(t.output))return json(res,{error:'PDF introuvable'},404);const st=await fsp.stat(t.output);const name=downloadName(t.series,t.number);res.writeHead(200,{'Content-Type':'application/pdf','Content-Disposition':`attachment; filename*=UTF-8''${encodeURIComponent(name)}`,'Content-Length':st.size,'Cache-Control':'no-store'});return fs.createReadStream(t.output).pipe(res);}
-    if(req.method==='POST'&&u.pathname==='/api/analyze'){const b=await bodyJson(req);if(!isHttpUrl(b.url||''))return json(res,{error:'URL invalide'},400);return json(res,await analyzeSeries(String(b.url).trim()));}
-    if(req.method==='POST'&&u.pathname==='/api/queue'){const b=await bodyJson(req);const ids=MANAGER.addMany(b.series||'Série',Array.isArray(b.chapters)?b.chapters:[]);return json(res,{added:ids.length,ids});}
-    if(req.method==='POST'&&u.pathname==='/api/settings'){const b=await bodyJson(req);MANAGER.setConcurrency(b.concurrency);return json(res,{ok:true,concurrency:MANAGER.concurrency,max:MAX_CONCURRENCY});}
-    if(req.method==='POST'&&u.pathname==='/api/open-folder')return json(res,{error:'Sur la version Web hébergée, utilise le bouton PDF pour télécharger sur ton appareil.'},400);
-    const m=u.pathname.match(/^\/api\/tasks\/([a-f0-9]+)\/([a-z]+)$/);if(req.method==='POST'&&m){const[ok,message]=MANAGER.action(m[1],m[2]);return json(res,{ok,message},ok?200:404);}
-    if(req.method==='GET'&&!u.pathname.startsWith('/api/'))return serveStatic(req,res,u);
-    return json(res,{error:'Route inconnue'},404);
-  }catch(e){console.error('[ERROR]',req.method,u.pathname,e);return json(res,{error:e?.message||String(e)},500);}
-}
-const server=http.createServer(handler);
-server.listen(PORT,HOST,()=>console.log(`${APP_NAME} ${VERSION} -> http://${HOST}:${PORT}`));
-process.on('SIGTERM',()=>server.close(()=>process.exit(0)));
+async function handler(req,res){const u=new URL(req.url,`http://${req.headers.host||'localhost'}`);if(req.method==='OPTIONS'){res.writeHead(204,{'Access-Control-Allow-Origin':'*','Access-Control-Allow-Methods':'GET,POST,OPTIONS','Access-Control-Allow-Headers':'Content-Type'});return res.end();}try{
+if(req.method==='GET'&&u.pathname==='/api/health')return json(res,{ok:true,app:APP_NAME,version:VERSION,mode:'proxy-client-pdf'});
+if(req.method==='GET'&&u.pathname==='/api/stats')return json(res,{ram_app:process.memoryUsage().rss,cpu_app:Number(((process.cpuUsage().user+process.cpuUsage().system)/1e6/Math.max(1,process.uptime())/Math.max(1,os.cpus().length)*100).toFixed(1)),proxy_active:proxyActive,proxy_max:PROXY_MAX,sessions:sessions.size});
+if(req.method==='GET'&&u.pathname==='/api/search')return json(res,await searchSources(u.searchParams.get('q')||''));
+if(req.method==='POST'&&u.pathname==='/api/analyze'){const b=await bodyJson(req);if(!isHttpUrl(b.url||''))return json(res,{error:'URL invalide'},400);return json(res,await analyzeSeries(String(b.url).trim()));}
+if(req.method==='POST'&&u.pathname==='/api/chapter-images'){const b=await bodyJson(req);if(!isHttpUrl(b.url||''))return json(res,{error:'URL invalide'},400);return json(res,await prepareChapter(String(b.url).trim()));}
+const pm=u.pathname.match(/^\/api\/page\/([a-f0-9]{24})\/(\d+)$/);if(req.method==='GET'&&pm)return proxyPage(req,res,pm[1],Number(pm[2]));
+if(req.method==='GET'&&!u.pathname.startsWith('/api/'))return serveStatic(req,res,u);
+return json(res,{error:'Route inconnue'},404);
+}catch(e){console.error('[ERROR]',req.method,u.pathname,e);return json(res,{error:e?.message||String(e)},500);}}
+const server=http.createServer(handler);server.requestTimeout=45000;server.headersTimeout=50000;server.keepAliveTimeout=7000;server.listen(PORT,HOST,()=>console.log(`${APP_NAME} ${VERSION} -> http://${HOST}:${PORT}`));process.on('SIGTERM',()=>server.close(()=>process.exit(0)));
