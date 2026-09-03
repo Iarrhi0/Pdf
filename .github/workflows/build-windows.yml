@@ -1,134 +1,158 @@
-name: Build Chapter Search PDF V4 Native
+name: Universal ZIP Extract and Build
 
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches: ["main", "master"]
     paths:
-      - '**/*.cs'
-      - '**/*.csproj'
-      - '**/*.zip'
-      - '**/Assets/**'
-      - '.github/workflows/build-windows.yml'
+      - "**.zip"
+      - ".github/workflows/universal-unzip-build.yml"
+
+permissions:
+  contents: read
 
 jobs:
-  build-windows:
+  extract-and-build:
     runs-on: windows-latest
-    timeout-minutes: 35
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup .NET 8
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '8.0.x'
-
-      - name: Detect newest V4 project
-        id: project
+      - name: Extract every project ZIP safely
+        id: extract
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $candidates = @()
+          $root = (Get-Location).Path
+          $out = Join-Path $root '_extracted'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
 
-          function Get-ProjectVersion([string]$projectPath) {
-            try {
-              [xml]$xml = Get-Content -LiteralPath $projectPath -Raw
-              $text = [string]$xml.Project.PropertyGroup.Version
-              if ([string]::IsNullOrWhiteSpace($text)) { return [version]'0.0.0' }
-              return [version]$text
-            } catch { return [version]'0.0.0' }
+          $zips = Get-ChildItem -Path $root -Filter '*.zip' -File -Recurse |
+            Where-Object { $_.FullName -notlike "$out*" -and $_.FullName -notlike '*\.git\*' }
+
+          if (-not $zips) {
+            Write-Host 'No ZIP found. Using repository files as the project.'
+            "workspace=$root" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            exit 0
           }
 
-          Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -File -Filter '*.csproj' | ForEach-Object {
-            $v = Get-ProjectVersion $_.FullName
-            if ($v.Major -ge 4) {
-              $candidates += [pscustomobject]@{ Project=$_.FullName; Version=$v; Source='repository' }
-            }
-          }
-
-          $zips = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -File -Filter '*.zip' | Where-Object {
-            $_.Name -match '(?i)chapter[-_ ]?search[-_ ]?pdf.*v4|v4.*webview2|v4.*multiengine'
-          }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
           foreach ($zip in $zips) {
-            Write-Host "Inspecting V4 ZIP: $($zip.FullName)"
-            $extractDir = Join-Path $env:RUNNER_TEMP ("chapter-search-v4-" + [guid]::NewGuid().ToString('N'))
-            New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
+            $relative = [IO.Path]::GetRelativePath($root, $zip.FullName)
+            $safeName = [IO.Path]::GetFileNameWithoutExtension($zip.Name) -replace '[^a-zA-Z0-9._-]', '_'
+            $destination = Join-Path $out $safeName
+            New-Item -ItemType Directory -Force -Path $destination | Out-Null
+            $destinationFull = [IO.Path]::GetFullPath($destination) + [IO.Path]::DirectorySeparatorChar
+
+            $archive = [IO.Compression.ZipFile]::OpenRead($zip.FullName)
             try {
-              Expand-Archive -LiteralPath $zip.FullName -DestinationPath $extractDir -Force
-              Get-ChildItem -Path $extractDir -Recurse -File -Filter '*.csproj' | ForEach-Object {
-                $v = Get-ProjectVersion $_.FullName
-                if ($v.Major -ge 4) {
-                  $candidates += [pscustomobject]@{ Project=$_.FullName; Version=$v; Source=$zip.Name }
+              foreach ($entry in $archive.Entries) {
+                if ([string]::IsNullOrEmpty($entry.FullName)) { continue }
+                $target = [IO.Path]::GetFullPath((Join-Path $destination $entry.FullName))
+                if (-not $target.StartsWith($destinationFull, [StringComparison]::OrdinalIgnoreCase)) {
+                  throw "Unsafe ZIP path rejected: $($entry.FullName)"
+                }
+                if ([string]::IsNullOrEmpty($entry.Name)) {
+                  New-Item -ItemType Directory -Force -Path $target | Out-Null
+                } else {
+                  New-Item -ItemType Directory -Force -Path ([IO.Path]::GetDirectoryName($target)) | Out-Null
+                  [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $true)
                 }
               }
-            } catch { Write-Warning "Could not inspect $($zip.Name): $($_.Exception.Message)" }
+            } finally { $archive.Dispose() }
+            Write-Host "Extracted $relative to $destination"
+          }
+          "workspace=$out" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Detect and build projects
+        shell: pwsh
+        env:
+          PROJECT_ROOT: ${{ steps.extract.outputs.workspace }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $artifact = Join-Path (Get-Location) '_artifacts'
+          New-Item -ItemType Directory -Force -Path $artifact | Out-Null
+          $built = 0
+
+          $dotnetProjects = Get-ChildItem $env:PROJECT_ROOT -Recurse -File -Filter '*.csproj'
+          foreach ($project in $dotnetProjects) {
+            $name = [IO.Path]::GetFileNameWithoutExtension($project.Name)
+            $dest = Join-Path $artifact "dotnet-$name"
+            dotnet restore $project.FullName
+            dotnet publish $project.FullName -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o $dest
+            $built++
           }
 
-          if (-not $candidates -or $candidates.Count -eq 0) { throw 'No V4 .NET project found.' }
-          $selected = $candidates | Sort-Object Version -Descending | Select-Object -First 1
-          Write-Host "Selected V4 $($selected.Version) from $($selected.Source)"
-          Write-Host "Project: $($selected.Project)"
-          "path=$($selected.Project)" >> $env:GITHUB_OUTPUT
-          "version=$($selected.Version)" >> $env:GITHUB_OUTPUT
-
-      - name: Restore dependencies
-        shell: pwsh
-        run: dotnet restore "${{ steps.project.outputs.path }}" --nologo
-
-      - name: Verify V4 build
-        shell: pwsh
-        run: |
-          dotnet build "${{ steps.project.outputs.path }}" -c Release --no-restore --nologo
-
-      - name: Publish LIGHT x64
-        shell: pwsh
-        run: |
-          $out = Join-Path $env:GITHUB_WORKSPACE 'publish\light'
-          dotnet publish "${{ steps.project.outputs.path }}" `
-            -c Release -r win-x64 --self-contained false `
-            -p:DebugType=None -p:DebugSymbols=false -o $out --nologo
-
-      - name: Publish STANDALONE x64 WebView2-safe
-        shell: pwsh
-        run: |
-          $out = Join-Path $env:GITHUB_WORKSPACE 'publish\standalone'
-          dotnet publish "${{ steps.project.outputs.path }}" `
-            -c Release -r win-x64 --self-contained true `
-            -p:PublishSingleFile=false -p:PublishTrimmed=false `
-            -p:DebugType=None -p:DebugSymbols=false -o $out --nologo
-
-      - name: Verify outputs
-        shell: pwsh
-        run: |
-          foreach ($kind in @('light','standalone')) {
-            $dir = Join-Path $env:GITHUB_WORKSPACE ("publish\" + $kind)
-            $exe = Join-Path $dir 'ChapterSearchPdfV4.exe'
-            $assets = Join-Path $dir 'Assets'
-            if (-not (Test-Path $exe)) { throw "${kind}: ChapterSearchPdfV4.exe missing" }
-            if (-not (Test-Path $assets)) { throw "${kind}: Assets missing" }
-            $loader = Get-ChildItem -Path $dir -Recurse -File -Filter 'WebView2Loader.dll' | Select-Object -First 1
-            if (-not $loader) { throw "${kind}: WebView2Loader.dll missing" }
-            Write-Host "$kind OK: $exe"
+          $gradleRoots = Get-ChildItem $env:PROJECT_ROOT -Recurse -File -Filter 'gradlew.bat' |
+            Select-Object -ExpandProperty Directory -Unique
+          foreach ($dir in $gradleRoots) {
+            Push-Location $dir.FullName
+            try { & .\gradlew.bat assembleRelease --no-daemon }
+            finally { Pop-Location }
+            $name = $dir.Name -replace '[^a-zA-Z0-9._-]', '_'
+            $dest = Join-Path $artifact "gradle-$name"
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            Get-ChildItem $dir.FullName -Recurse -File -Include '*.apk','*.aab','*.jar' |
+              Copy-Item -Destination $dest -Force
+            $built++
           }
 
-      - name: Package Windows builds
-        shell: pwsh
-        run: |
-          Compress-Archive -Path "$env:GITHUB_WORKSPACE\publish\light\*" -DestinationPath "$env:GITHUB_WORKSPACE\Chapter-Search-PDF-V4-LIGHT-x64.zip" -Force
-          Compress-Archive -Path "$env:GITHUB_WORKSPACE\publish\standalone\*" -DestinationPath "$env:GITHUB_WORKSPACE\Chapter-Search-PDF-V4-STANDALONE-x64.zip" -Force
+          $nodeRoots = Get-ChildItem $env:PROJECT_ROOT -Recurse -File -Filter 'package.json' |
+            Where-Object { $_.FullName -notlike '*\node_modules\*' } |
+            Select-Object -ExpandProperty Directory -Unique
+          foreach ($dir in $nodeRoots) {
+            Push-Location $dir.FullName
+            try {
+              if (Test-Path 'package-lock.json') { npm ci } else { npm install }
+              $package = Get-Content 'package.json' -Raw | ConvertFrom-Json
+              if ($package.scripts.build) { npm run build }
+            } finally { Pop-Location }
+            $name = $dir.Name -replace '[^a-zA-Z0-9._-]', '_'
+            $dest = Join-Path $artifact "node-$name"
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            foreach ($candidate in @('dist','build','out','.output\public')) {
+              $source = Join-Path $dir.FullName $candidate
+              if (Test-Path $source) { Copy-Item $source -Destination $dest -Recurse -Force }
+            }
+            $built++
+          }
 
-      - name: Upload LIGHT build
+          $staticRoots = Get-ChildItem $env:PROJECT_ROOT -Recurse -File -Filter 'index.html' |
+            Where-Object { $_.FullName -notlike '*\node_modules\*' -and $_.FullName -notlike '*\dist\*' -and $_.FullName -notlike '*\build\*' } |
+            Select-Object -ExpandProperty Directory -Unique
+          foreach ($dir in $staticRoots) {
+            $name = $dir.Name -replace '[^a-zA-Z0-9._-]', '_'
+            Copy-Item $dir.FullName -Destination (Join-Path $artifact "static-$name") -Recurse -Force
+            $built++
+          }
+
+          if ($built -eq 0) {
+            Write-Warning 'Unknown project type. Publishing extracted source only.'
+            Copy-Item $env:PROJECT_ROOT -Destination (Join-Path $artifact 'extracted-source') -Recurse -Force
+          }
+
+      - name: Upload build results
         uses: actions/upload-artifact@v4
         with:
-          name: Chapter-Search-PDF-V4-LIGHT-x64
-          path: Chapter-Search-PDF-V4-LIGHT-x64.zip
+          name: universal-build-${{ github.run_number }}
+          path: _artifacts/
           if-no-files-found: error
-
-      - name: Upload STANDALONE build
-        uses: actions/upload-artifact@v4
-        with:
-          name: Chapter-Search-PDF-V4-STANDALONE-x64
-          path: Chapter-Search-PDF-V4-STANDALONE-x64.zip
-          if-no-files-found: error
+          retention-days: 14
