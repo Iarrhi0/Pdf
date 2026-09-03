@@ -1,12 +1,12 @@
 {
   "name": "chapter-search-pdf-web",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "private": true,
-  "description": "Chapter Search PDF Web V3 - Render Free streaming low-memory",
+  "description": "Chapter Search PDF Web V3.2 - true streaming PDF for Render Free batch downloads",
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node --max-old-space-size=256 server.js",
+    "start": "node --max-old-space-size=192 server.js",
     "dev": "node --watch server.js",
     "test": "node tests/smoke.mjs"
   },
@@ -15,7 +15,6 @@
   },
   "dependencies": {
     "cheerio": "1.1.2",
-    "pdfkit": "0.17.2",
     "sharp": "0.34.3"
   }
 }

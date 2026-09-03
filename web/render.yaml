@@ -15,7 +15,7 @@ services:
       - key: CSPDF_CONCURRENCY
         value: "2"
       - key: CSPDF_MAX_CONCURRENCY
-        value: "3"
+        value: "2"
       - key: CSPDF_MEMORY_SOFT_MB
         value: "260"
       - key: CSPDF_MEMORY_HARD_MB
