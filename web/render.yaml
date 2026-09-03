@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: chapter-search-pdf-web-auto
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm install --omit=dev
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeployTrigger: 'off'
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: CSPDF_CONCURRENCY
+        value: "2"
+      - key: CSPDF_MAX_CONCURRENCY
+        value: "4"

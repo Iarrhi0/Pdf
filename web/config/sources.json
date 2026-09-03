@@ -1,0 +1,6 @@
+{
+  "sources": [
+    {"name":"SushiScan","base":"https://sushiscan.fr","search":"https://sushiscan.fr/?s={q}&post_type=wp-manga","enabled":true},
+    {"name":"AllPornComic","base":"https://allporncomic.com","search":"https://allporncomic.com/?s={q}","enabled":true}
+  ]
+}

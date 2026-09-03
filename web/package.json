@@ -1,0 +1,21 @@
+{
+  "name": "chapter-search-pdf-web",
+  "version": "2.2.0",
+  "private": true,
+  "description": "Chapter Search PDF Web/PWA - Node.js backend, Android/PC, deployable on Render",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node tests/smoke.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "cheerio": "1.1.2",
+    "pdfkit": "0.17.2",
+    "sharp": "0.34.3"
+  }
+}

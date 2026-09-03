@@ -1,0 +1,12 @@
+{
+  "name":"Chapter Search PDF Web",
+  "short_name":"Chapter PDF",
+  "description":"Recherche, analyse et téléchargement de chapitres en PDF depuis Android et PC.",
+  "start_url":"/",
+  "display":"standalone",
+  "background_color":"#06101e",
+  "theme_color":"#091526",
+  "icons":[
+    {"src":"/icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}
+  ]
+}
